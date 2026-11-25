@@ -1,0 +1,23 @@
+# Placeholder source: the deployment replaces Path= (a drop-in in /etc/sysupdate.d or a staging source, docs/updates.md).
+# Verify=yes: SHA256SUMS + SHA256SUMS.gpg against /usr/lib/systemd/import-pubring.pgp (release key, under verity).
+# Compression: xz. systemd-pull 257 in Debian 13 is built without zstd and writes a .zst file to the partition as is
+# (sysupdate still reports success: the hash covers the compressed download; the slot then fails in the initrd).
+[Transfer]
+Verify=yes
+# Not a default: without it sysupdate treats the newest *installed* version as current and may vacuum the booted
+# slot (the booted release would be erased once a newer one is installed but bad).
+ProtectVersion=%A
+
+[Source]
+Type=url-file
+Path=https://updates.example.invalid/foilbird-deb/
+MatchPattern=foilbird-deb_@v.usr-x86-64.@u.raw.xz
+
+[Target]
+Type=partition
+Path=auto
+MatchPartitionType=usr
+MatchPattern=usr_@v
+ReadOnly=1
+# InstancesMax= belongs to [Target]
+InstancesMax=2

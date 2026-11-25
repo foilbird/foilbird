@@ -1,0 +1,78 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Initrd and recovery (FinalizeScripts=): no shell and no interpreter, as on Talos. Removes shells,
+# interpreters and every script that needs one (nothing in these trees runs them: units and udev rules call binaries;
+# emergency/rescue reboot), then fails the build if one is left. Also fails unless the tree's os-release is Debian's
+# (then made Foilbird's: ID=foilbird, ID_LIKE=debian, Debian's VERSION_ID),
+# and lists every file that no package owns (what mkosi, the build script and the extra tree added): the initrd
+# is from Debian packages only. Note: /etc/initrd-release is an absolute link; read on an unpacked tree it
+# resolves to the os-release of the machine that reads it (that is how a first check saw "Ubuntu" in the initrd).
+set -eu
+R="$BUILDROOT"
+rm -f "$R"/usr/bin/sh "$R"/usr/bin/sh.distrib "$R"/usr/bin/bash "$R"/usr/bin/rbash "$R"/usr/bin/dash \
+      "$R"/usr/bin/bashbug "$R"/usr/bin/mawk "$R"/usr/bin/awk "$R"/usr/bin/sed "$R"/usr/bin/perl "$R"/usr/bin/perl5* \
+      "$R"/etc/alternatives/awk "$R"/etc/alternatives/awk.1.gz "$R"/etc/alternatives/nawk "$R"/usr/bin/nawk
+rm -rf "$R"/usr/share/perl5 "$R"/usr/lib/x86_64-linux-gnu/perl* "$R"/usr/share/debconf "$R"/usr/share/bash-completion \
+       "$R"/etc/skel "$R"/etc/bash.bashrc "$R"/etc/profile "$R"/etc/profile.d "$R"/usr/share/debianutils/shells.d
+# every file that starts with "#!" (shell, perl, ... scripts of the essential packages) is dead without its interpreter
+scripts() { find "$R" -xdev -type f \( -path "$R/usr/*" -o -path "$R/etc/*" \) -size -1024k \
+  -exec sh -c 'for f; do [ "$(head -c 2 "$f")" = "#!" ] && echo "$f"; done; true' _ {} +; }
+n=$(scripts | tee "$R/.foilbird-scripts" | wc -l); while IFS= read -r f; do rm -f "$f"; done < "$R/.foilbird-scripts"; rm -f "$R/.foilbird-scripts"
+echo "no-interpreters: $n scripts removed"
+left=$(find "$R" -xdev \( -type f -o -type l \) \( -name sh -o -name 'sh.*' -o -name bash -o -name rbash -o -name dash \
+  -o -name ash -o -name zsh -o -name ksh -o -name busybox -o -name 'perl*' -o -name 'python*' -o -name awk -o -name mawk \
+  -o -name gawk -o -name nawk -o -name sed -o -name 'lua*' -o -name tclsh -o -name 'ruby*' \) \
+  \( -path "$R/usr/bin/*" -o -path "$R/usr/sbin/*" -o -path "$R/usr/libexec/*" -o -path "$R/bin/*" -o -path "$R/sbin/*" \) -print)
+[ -z "$left$(scripts)" ] || { echo "ERROR: interpreter or script left: $left $(scripts)" >&2; exit 1; }
+# the dpkg stash (dpkg-stash.postinst): drop stanzas of packages with no file left, then delete the file lists
+st="$R/usr/lib/foilbird/dpkg/status"; L="$R/.foilbird-dpkg-lists"
+if [ -d "$L" ]; then
+  gone=""
+  for l in "$L"/*.list; do
+    p=$(basename "$l" .list); p=${p%%:*}; any=0
+    while IFS= read -r x; do [ -n "$x" ] && [ ! -d "$R$x" ] && { [ -e "$R$x" ] || [ -L "$R$x" ]; } && { any=1; break; }; done < "$l"
+    [ $any = 1 ] || gone="$gone $p"
+  done
+  # plus the packages removed with RemovePackages= (their lists may still be in the stash)
+  gone="$gone dpkg perl-base"
+  pat=$(echo $gone | tr ' ' '\n' | sort -u | paste -sd'|')
+  awk -v RS= -v ORS='\n\n' -v pat="^Package: ($pat)\n" '$0 !~ pat' "$st" > "$st.new" && mv "$st.new" "$st"; chmod 0644 "$st"
+  # files no package owns (paths of merged-/usr packages normalised: /bin -> /usr/bin, ...)
+  cat "$L"/*.list | sed -E 's#^/(bin|sbin|lib|lib64)/#/usr/\1/#' | sort -u > "$R/.foilbird-owned"
+  (cd "$R" && find . -xdev \( -type f -o -type l \) ! -path './.foilbird-*' | sed 's#^\.##' | sort) > "$R/.foilbird-all"
+  un=$(comm -23 "$R/.foilbird-all" "$R/.foilbird-owned")
+  echo "not owned by a package: $(echo "$un" | grep -c .) files"; echo "$un" | sed 's/^/  /'
+  rm -f "$R/.foilbird-owned" "$R/.foilbird-all"
+  rm -rf "$L"
+  echo "dpkg status: $(grep -c '^Package:' "$st") packages; dropped (no file left):$(echo $gone | tr ' ' '\n' | sort -u | paste -sd' ')"
+fi
+# os-release: Debian's from base-files of this build (never the build host's), made the product's
+# Product identity: ID=foilbird, ID_LIKE=debian, NAME and PRETTY_NAME "Foilbird OS". Debian's version fields
+# (VERSION_ID, VERSION, VERSION_CODENAME, DEBIAN_VERSION_FULL) stay: they name the base release, which scanners read
+# through ID_LIKE (Grype) and /etc/debian_version (Trivy), T13. Debian's URLs go (not Debian's support); IMAGE_* and
+# FOILBIRD_* lines stay. Converts only the tree's own Debian file (ID=debian, no ID_LIKE; a build host's os-release
+# carries another ID) and checks the result: VERSION_ID = the major of the tree's /etc/debian_version.
+# The same block is in images/debian/mkosi/mkosi.finalize and images/debian/tools/no-interpreters.finalize.
+foilbird_os_release() {
+  o="$1/usr/lib/os-release"
+  [ -f "$o" ] && [ ! -L "$o" ] || { echo "ERROR: $o is not a regular file" >&2; exit 1; }
+  if ! grep -qx 'ID=foilbird' "$o"; then
+    grep -qx 'ID=debian' "$o" && ! grep -q '^ID_LIKE=' "$o" || { echo "ERROR: $o is not Debian's: $(grep -m1 '^PRETTY_NAME=' "$o")" >&2; exit 1; }
+    { printf 'PRETTY_NAME="Foilbird OS"\nNAME="Foilbird OS"\nID=foilbird\nID_LIKE=debian\n'
+      grep -vE '^(PRETTY_NAME|NAME|ID|ID_LIKE|HOME_URL|SUPPORT_URL|BUG_REPORT_URL|PRIVACY_POLICY_URL)=' "$o" || true; } > "$o.new"
+    chmod 0644 "$o.new"; mv "$o.new" "$o"
+  fi
+  maj=$(cut -d. -f1 "$1/etc/debian_version")
+  grep -qx 'ID_LIKE=debian' "$o" && grep -qE "^VERSION_ID=\"?$maj\"?\$" "$o" \
+    || { echo "ERROR: $o: no ID_LIKE=debian or VERSION_ID is not $maj (/etc/debian_version $(cat "$1/etc/debian_version"))" >&2; exit 1; }
+  echo "os-release: $(grep -E '^(ID|ID_LIKE|NAME|VERSION_ID|IMAGE_ID|IMAGE_VERSION)=' "$o" | paste -sd' ')"
+}
+foilbird_os_release "$R"
+o="$R/usr/lib/os-release"
+# initrd: /etc/initrd-release (mkosi, MakeInitrd=) -> /etc/os-release -> ../usr/lib/os-release, all inside the tree
+# (the links are absolute/relative to the initrd root; never read them from here, they would resolve on the build host)
+if [ -L "$R/etc/initrd-release" ] || [ -e "$R/etc/initrd-release" ]; then
+  [ "$(readlink "$R/etc/initrd-release")" = /etc/os-release ] && [ "$(readlink "$R/etc/os-release")" = ../usr/lib/os-release ] \
+    || { echo "ERROR: /etc/initrd-release does not resolve to the tree's /usr/lib/os-release" >&2; exit 1; }
+fi
+echo "os-release: $(grep -m1 '^PRETTY_NAME=' "$o") $(grep '^IMAGE_' "$o" | paste -sd' ')"

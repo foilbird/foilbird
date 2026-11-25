@@ -1,0 +1,11 @@
+# /var source (docs/disk-encryption.md):
+#   disk/foilbird/var-luks  the var partition holds LUKS2  -> foil-var-unlock opens it, /var comes from /dev/mapper/var
+#   disk/foilbird/var-plain the var partition holds ext4 (disk set up before /var encryption) -> mounted as is
+#   disk/foilbird/var-fs    what var.mount mounts: the opened dm-crypt device, or the plain partition
+# An encrypted /var that does not open never gets var-fs: it is not replaced by anything plain.
+SUBSYSTEM!="block", GOTO="foilbird_var_end"
+ACTION=="remove", GOTO="foilbird_var_end"
+ENV{ID_PART_ENTRY_NAME}=="var", ENV{ID_FS_TYPE}=="crypto_LUKS", SYMLINK+="disk/foilbird/var-luks"
+ENV{ID_PART_ENTRY_NAME}=="var", ENV{ID_FS_TYPE}=="ext4", SYMLINK+="disk/foilbird/var-plain disk/foilbird/var-fs"
+ENV{DM_NAME}=="var", ENV{DM_UUID}=="CRYPT-LUKS2-*", ENV{ID_FS_TYPE}=="ext4", SYMLINK+="disk/foilbird/var-fs"
+LABEL="foilbird_var_end"

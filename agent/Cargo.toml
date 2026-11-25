@@ -1,0 +1,63 @@
+[package]
+name = "foil-agent"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Node agent: typed gRPC API for OS lifecycle (PoC)"
+publish = false
+
+[[bin]]
+name = "foil-agent"
+path = "src/main.rs"
+
+[features]
+default = []
+# Lab only: named points in the config save where the agent kills itself or
+# hangs (spec in /boot/loader/foilbird/lab.crash), for crash-window tests. Never in
+# a product build.
+lab-crash-points = []
+# Lab only (PoC bridge, api/registration.md BRIDGE): also look for the agent's
+# TLS material and the bridge configuration (node.*, k8s.*) in /boot/loader/foilbird
+# on the ESP. Never in a product build: the ESP is unauthenticated, whoever
+# writes it chooses the client CA, the network and the k8s join.
+esp-bridge-tls = []
+
+[dependencies]
+bytes = "1.12.1"
+futures-util = { version = "0.3.34", default-features = false }
+hex = "0.4.3"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["client", "http1"] }
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "ring", "tls12"] }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
+libc = "0.2.191"
+pgp = "0.21.1"
+prost = "0.14.6"
+regex = "1.13.1"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+ruzstd = "0.9.1"
+sha2 = "0.11.1"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "fs", "net", "time", "io-util", "sync"] }
+tonic = { version = "0.14.9", default-features = false, features = ["transport", "codegen", "router", "tls-ring"] }
+tonic-prost = "0.14.9"
+tower-layer = "0.3.3"
+tower-service = "0.3.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi"] }
+x509-parser = { version = "0.18.1", default-features = false }
+zbus = { version = "6.3.0", default-features = false, features = ["tokio"] }
+
+[dev-dependencies]
+rcgen = "0.14.10"
+
+[build-dependencies]
+prost-reflect = "0.16.5"
+protox = "0.10.0"
+tonic-prost-build = "0.14.9"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

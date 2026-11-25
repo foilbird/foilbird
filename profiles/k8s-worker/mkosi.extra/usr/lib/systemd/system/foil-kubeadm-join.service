@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# First join only: once /etc/kubernetes/kubelet.conf exists (persistent, see tmpfiles), kubelet rejoins by itself.
+[Unit]
+Description=Join the Kubernetes cluster (kubeadm, /run/foilbird/config/k8s.join)
+Wants=network-online.target
+After=network-online.target containerd.service foil-config.service foil-k8s-env.service time-sync.target
+Requires=containerd.service
+ConditionPathExists=/run/foilbird/config/k8s.join
+ConditionPathExists=!/etc/kubernetes/kubelet.conf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Owner policy: the first join needs a synchronized clock. Waits up to 120 s, then fails with the reason in
+# GetHealth (time-synced FAIL) and the unit retries. Later boots skip this unit (kubelet.conf exists).
+ExecStartPre=/usr/bin/foil-agent wait-time-sync --timeout 120
+# Preflight checks that do not apply to this OS: no swap anyway, no shell tools; the remaining checks stay on.
+ExecStart=/usr/bin/kubeadm join --config=/run/foilbird/config/k8s.join --ignore-preflight-errors=SystemVerification,FileExisting-conntrack,FileExisting-socat,FileExisting-ethtool,FileExisting-tc,FileExisting-ebtables,FileExisting-ip
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

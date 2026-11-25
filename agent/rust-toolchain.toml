@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# The compiler of every agent build (build-release.sh, tests): one exact release, so two build hosts or CI produce the
+# same binaries. 1.100.0 = the release the lab dists were built with (rustc 0ef1bc386 2026-11-09). Bump only in a commit
+# of its own, together with the tool versions in build-release.sh, and rebuild the dist.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+targets = ["x86_64-unknown-linux-musl"]

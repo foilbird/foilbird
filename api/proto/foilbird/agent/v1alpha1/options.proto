@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Access levels and roles for node agent RPCs. Every RPC in foilbird.agent.* MUST
+// carry exactly one (foilbird.agent.v1alpha1.access) option and at least one
+// (foilbird.agent.v1alpha1.roles) option; api/tools/check_proto.py and the agent build
+// fail otherwise. The management gateway generates MCP tools from the levels;
+// EMERGENCY is never published to MCP. The agent authorizes by the roles: a
+// role is the set of RPCs that list it (deny by default).
+syntax = "proto3";
+
+package foilbird.agent.v1alpha1;
+
+import "google/protobuf/descriptor.proto";
+
+enum AccessLevel {
+  ACCESS_LEVEL_UNSPECIFIED = 0; // invalid; rejected by the agent and the check
+  ACCESS_LEVEL_READ = 1;        // no state change on the node
+  ACCESS_LEVEL_OPERATE = 2;     // reversible, no effect on running workloads
+  ACCESS_LEVEL_DESTRUCTIVE = 3; // affects workloads; human confirmation in the gateway
+  ACCESS_LEVEL_EMERGENCY = 4;   // operator role only, never via MCP
+  // Read-only, but returns free text from the node (journal, kernel log).
+  // Redacted by the agent; kept apart from READ so the gateway can apply its
+  // own policy to logs (who may see them, size, rate) independently of
+  // structured state. Never changes the node.
+  ACCESS_LEVEL_DIAG = 5;
+}
+
+// Roles of the caller, from the client certificate's Subject OU (the name
+// after ROLE_, lower case: OU=reader, OU=diag, ...). A certificate with
+// several OUs may call the union of their RPCs; one without a known OU, or
+// without the clientAuth extended key usage, may call nothing.
+enum Role {
+  ROLE_UNSPECIFIED = 0; // invalid in (roles)
+  ROLE_READER = 1;      // READ RPCs: state, no free text
+  ROLE_DIAG = 2;        // READ + DIAG: journal, kernel log
+  ROLE_UPDATER = 3;     // READ + staging an update and rebooting into it
+  ROLE_CONFIGURER = 4;  // READ + validating and applying NodeConfig
+  ROLE_CONTROLLER = 5;  // gateway/controller: all but EMERGENCY and RaiseMinVersion
+  ROLE_OPERATOR = 6;    // human operator: everything
+}
+
+extend google.protobuf.MethodOptions {
+  AccessLevel access = 50001;
+  repeated Role roles = 50002;
+}

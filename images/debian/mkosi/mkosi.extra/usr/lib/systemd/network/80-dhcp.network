@@ -1,0 +1,7 @@
+# Proof of concept only: DHCP on every Ethernet port. In the product the node agent renders the network config.
+[Match]
+Type=ether
+Kind=!*
+
+[Network]
+DHCP=ipv4

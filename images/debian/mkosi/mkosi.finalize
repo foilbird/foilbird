@@ -1,0 +1,192 @@
+#!/bin/sh
+# (stash itself is in mkosi.postinst) Keep the dpkg database as a plain data file for scanners (Trivy/Grype/SBOM), outside any package manager.
+# Only /usr is shipped, so it lives in /usr/lib/foilbird/dpkg; var-lib-dpkg.mount binds it read-only onto /var/lib/dpkg.
+set -eu
+# no unit may require the ESP mount: boot.mount is the automount's mount, unmounted after 60 s idle, and its stop job
+# cancels the start job of every unit that Requires= it (foil-install@, "job canceled" in CI). Units reach /boot by path
+# (the automount mounts it), with After=boot.automount at most. docs/boot-assessment.md (ESP)
+bad=$(find "$BUILDROOT/usr/lib/systemd" "$BUILDROOT/etc/systemd" -type f \( -name '*.service' -o -name '*.conf' -o -name '*.mount' -o -name '*.target' -o -name '*.timer' -o -name '*.socket' -o -name '*.path' \) 2>/dev/null \
+  | xargs -r grep -l -E '^[[:space:]]*(RequiresMountsFor=.*(^|[[:space:]=])/boot([[:space:]/]|$)|(Requires|Requisite|BindsTo|PartOf)=.*(^|[[:space:]=])boot\.mount([[:space:]]|$))' 2>/dev/null || true)
+[ -z "$bad" ] || { echo "ERROR: units requiring the ESP mount (/boot in RequiresMountsFor= or Requires=boot.mount): $bad" >&2; exit 1; }
+echo "ESP: no unit requires boot.mount"
+dst="$BUILDROOT/usr/lib/foilbird/dpkg/status"
+[ -f "$dst" ] || { echo "ERROR: $dst missing (mkosi.postinst did not run?)" >&2; exit 1; }
+# drop stanzas of packages removed by RemovePackages= (their files are gone, a phantom entry would give false CVE hits)
+awk -v RS= -v ORS='\n\n' '!/^Package: (dpkg|perl-base)\n/' "$dst" > "$dst.new" && mv "$dst.new" "$dst"
+chmod 0644 "$dst"
+echo "dpkg status: $(grep -c '^Package:' "$dst") packages -> /usr/lib/foilbird/dpkg/status"
+echo "--- leftovers (must be empty):"
+find "$BUILDROOT/usr" \( -name 'dpkg*' -o -name 'perl*' -o -name 'apt*' -o -name 'python3*' -o -name 'ssh' -o -name 'curl' -o -name 'wget' \) -type f \
+  -not -path '*/share/locale/*' -not -path '*/share/doc/*' -not -path '*/modules/*' | head
+# /var/lib/dpkg is a read-only bind of /usr/lib/foilbird/dpkg (var-lib-dpkg.mount): no tmpfiles line may touch it
+# (it would fail on the read-only mount at every boot), and the stash must hold exactly the status file.
+n=$(cat "$BUILDROOT"/usr/lib/tmpfiles.d/*.conf | grep -cE '^[^#[:space:]]+[[:space:]]+/var/lib/dpkg(/|[[:space:]]|$)' || true)
+[ "$n" = 0 ] || { echo "ERROR: $n tmpfiles lines for /var/lib/dpkg, it is a read-only bind mount" >&2; exit 1; }
+[ "$(ls -A "$BUILDROOT/usr/lib/foilbird/dpkg")" = status ] || { echo "ERROR: /usr/lib/foilbird/dpkg must hold only status" >&2; exit 1; }
+[ -L "$BUILDROOT/usr/lib/systemd/system/local-fs.target.wants/var-lib-dpkg.mount" ] || { echo "ERROR: var-lib-dpkg.mount not enabled" >&2; exit 1; }
+# Options= in boot.mount.d replaces the line systemd-gpt-auto-generator writes. The generator cannot run at
+# build time (it needs the EFI loader variables and the disk), so the drop-in pins the systemd version its options were
+# checked on; a different systemd fails the build until someone checks on a VM and updates the pin.
+esp="$BUILDROOT/usr/lib/systemd/system/boot.mount.d/50-foil-esp.conf"
+pin=$(sed -n 's/^# foil-generated-options: //p' "$esp")
+pv=$(echo "$pin" | sed -n 's/^systemd=\([^ ]*\) .*/\1/p'); po=$(echo "$pin" | sed -n 's/^systemd=[^ ]* //p')
+sv=$(awk -v RS= '/^Package: systemd\n/' "$dst" | sed -n 's/^Version: //p'); su=${sv#*:}; su=${su%%-*}
+opts=$(sed -n 's/^Options=//p' "$esp")
+[ -n "$pv" ] && [ -n "$po" ] && [ -n "$opts" ] || { echo "ERROR: $esp: no pin line or no Options=" >&2; exit 1; }
+[ "$su" = "$pv" ] || { echo "ERROR: systemd $sv in the image, boot.mount.d options were checked on $pv: boot a VM, compare /run/systemd/generator/boot.mount, update the pin" >&2; exit 1; }
+for o in $(echo "$po" | tr ',' ' '); do
+  case ",$opts," in *",$o,"*) ;; *) echo "ERROR: generated ESP mount option $o is missing in $esp" >&2; exit 1;; esac
+done
+echo "boot.mount.d: systemd $sv, generator options ($po) all in Options=$opts"
+# /etc is tmpfs. /etc/os-release and /etc/debian_version are COPIES of the files in /usr, made by tmpfiles at boot:
+# Trivy does not follow symlinks there and then sees no OS at all ("family none", 0 packages); Grype reads both.
+# systemd's own etc.conf links /etc/os-release (L); every line for it is dropped so that exactly one C line remains.
+[ -f "$BUILDROOT/etc/debian_version" ] || { echo "ERROR: no /etc/debian_version in the build root" >&2; exit 1; }
+mkdir -p "$BUILDROOT/usr/share/factory/etc"; cp "$BUILDROOT/etc/debian_version" "$BUILDROOT/usr/share/factory/etc/debian_version"
+sed -i -E '/^[^#[:space:]]+[[:space:]]+\/etc\/os-release([[:space:]]|$)/d' "$BUILDROOT"/usr/lib/tmpfiles.d/*.conf
+cat > "$BUILDROOT/usr/lib/tmpfiles.d/foil-etc-os-files.conf" <<'T'
+# copies, not links: scanners (Trivy) read the OS only from regular files
+C /etc/os-release - - - - /usr/lib/os-release
+C /etc/debian_version - - - - /usr/share/factory/etc/debian_version
+T
+for e in os-release debian_version; do
+  n=$(cat "$BUILDROOT"/usr/lib/tmpfiles.d/*.conf | grep -cE "^[^#[:space:]]+[[:space:]]+/etc/$e([[:space:]]|\$)" || true)
+  [ "$n" = 1 ] || { echo "ERROR: $n tmpfiles lines for /etc/$e, expected exactly the C line" >&2; exit 1; }
+done
+echo "debian_version: $(cat "$BUILDROOT/etc/debian_version"); /etc/os-release and /etc/debian_version: tmpfiles C (copies)"
+# Only /usr is shipped: modprobe.d snippets that packages put into /etc (NVIDIA's nvidia.conf, nvidia-modeset.conf) would
+# be lost; move them to /usr/lib/modprobe.d and show what they say
+for f in "$BUILDROOT"/etc/modprobe.d/*.conf; do [ -e "$f" ] || continue; echo "modprobe.d from /etc: $(basename "$f"): $(grep -v '^#' "$f" | tr '\n' ';')"; mv "$f" "$BUILDROOT/usr/lib/modprobe.d/"; done
+# Everything else packages put into /etc is lost at boot (/etc is tmpfs): /etc is filled from /usr/share/factory.
+# Copy it there and let tmpfiles recreate it at boot: C for files (copied from factory), L for symlinks (alternatives).
+# Not copied: accounts (sysusers creates them), identity/runtime files, unit enablement (systemd presets on first boot).
+# /etc/hosts is not copied: it is a link to /run/foilbird/hosts, rendered by the agent (foil-hosts.conf).
+tf="$BUILDROOT/usr/lib/tmpfiles.d/foil-etc-factory.conf"; : > "$tf"; nf=0; nl=0
+( cd "$BUILDROOT" && find etc \( -type f -o -type l \) | sort ) | while read -r e; do
+  case "$e" in etc/passwd*|etc/group*|etc/shadow*|etc/gshadow*|etc/subuid*|etc/subgid*|etc/machine-id|etc/hostname|etc/os-release|etc/mtab|etc/resolv.conf|etc/hosts|etc/debian_version|etc/systemd/*|etc/.pwd.lock) continue;; esac
+  mkdir -p "$BUILDROOT/usr/share/factory/$(dirname "$e")"
+  if [ -L "$BUILDROOT/$e" ]; then echo "L /$e - - - - $(readlink "$BUILDROOT/$e")" >> "$tf"
+  else cp -a "$BUILDROOT/$e" "$BUILDROOT/usr/share/factory/$e"; echo "C /$e" >> "$tf"; fi
+done
+echo "etc->factory: $(grep -c '^C ' "$tf") files, $(grep -c '^L ' "$tf") symlinks; netconfig: $(grep -c ' /etc/netconfig' "$tf")"
+# NVIDIA only in an image with the NVIDIA userspace (variant gpu; mkosi.build decides the same by nvidia-driver-cuda).
+# There nvidia-persistenced is wired: ordered after the driver (foil-order.conf), enabled by a symlink (presets do not
+# run, 00-foil.preset), its user declared for sysusers (adduser in postinst writes /etc, which is not shipped).
+# Without it the image carries none of this and no NVIDIA kernel module: anything of it here is an error.
+nvko=$(find "$BUILDROOT/usr/lib/modules" -path '*/updates/dkms/nvidia*.ko*' 2>/dev/null | wc -l)
+if [ -f "$BUILDROOT/usr/lib/systemd/system/nvidia-persistenced.service" ]; then
+  [ "$nvko" -gt 0 ] || { echo "ERROR: NVIDIA userspace without the NVIDIA kernel modules" >&2; exit 1; }
+  d="$BUILDROOT/usr/lib/systemd/system/nvidia-persistenced.service.d"; mkdir -p "$d" "$BUILDROOT/usr/lib/systemd/system/multi-user.target.wants"
+  install -m 0644 "${SRCDIR:?}/nvidia/nvidia-persistenced.service.d/foil-order.conf" "$d/foil-order.conf"
+  ln -sfn ../nvidia-persistenced.service "$BUILDROOT/usr/lib/systemd/system/multi-user.target.wants/nvidia-persistenced.service"
+  echo 'u nvidia-persistenced - "NVIDIA Persistence Daemon" /nonexistent' > "$BUILDROOT/usr/lib/sysusers.d/foil-nvidia-persistenced.conf"
+  echo "NVIDIA: userspace and $nvko kernel modules; nvidia-persistenced wired"
+else
+  nv=$(find "$BUILDROOT/usr" \( -path '*/updates/dkms/nvidia*' -o -path '*/nvidia-persistenced.service.d*' -o -name 'nvidia-persistenced.service' \
+    -o -name 'foil-nvidia-persistenced.conf' -o -name 'nvidia-open-kernel-modules.json' -o -name 'nvidia-inputs.json' \) 2>/dev/null | head -3)
+  [ -z "$nv" ] || { echo "ERROR: NVIDIA component in an image without the NVIDIA userspace: $nv" >&2; exit 1; }
+  echo "NVIDIA: none (no NVIDIA userspace in this image)"
+fi
+# same for tpm-udev: its postinst creates the tss user and group with adduser (in /etc); 60-tpm-udev.rules sets
+# OWNER/GROUP=tss on /dev/tpm*, udev logs "Unknown user 'tss'" without them (the TPM users here run as root either way)
+echo 'u tss - "TPM software stack" /nonexistent' > "$BUILDROOT/usr/lib/sysusers.d/foil-tss.conf"
+# Release key for systemd-sysupdate (Verify=yes). systemd 257 reads /usr/lib/systemd/import-pubring.gpg, 259 reads
+# import-pubring.pgp; Debian ships a default import-pubring.gpg with Fedora, Ubuntu and openSUSE keys, which would
+# accept their signatures on our update channel. The build must provide the project key (extra tree, see README)
+# under both names; refuse the image if the keyring is missing or still holds distribution keys.
+k="$BUILDROOT/usr/lib/systemd/import-pubring.gpg"
+[ -s "$k" ] || { echo "ERROR: no release keyring at /usr/lib/systemd/import-pubring.gpg" >&2; exit 1; }
+if grep -aqE 'fedoraproject\.org|cdimage@ubuntu\.com|opensuse\.org' "$k"; then
+  echo "ERROR: /usr/lib/systemd/import-pubring.gpg is the distribution default (foreign signing keys), not the release key" >&2; exit 1
+fi
+# Exactly one key, and it is the release key named by the build (mkosi --environment=FOILBIRD_RELEASE_KEY_FPR=<fingerprint>)
+[ -n "${FOILBIRD_RELEASE_KEY_FPR:-}" ] || { echo "ERROR: FOILBIRD_RELEASE_KEY_FPR not set (fingerprint of the release key)" >&2; exit 1; }
+fprs=$(GNUPGHOME=$(mktemp -d) gpg --show-keys --with-colons "$k" 2>/dev/null | awk -F: '$1=="pub"{p=1;next} $1=="fpr"&&p{print $10;p=0}')
+if [ "$fprs" != "$(echo "$FOILBIRD_RELEASE_KEY_FPR" | tr a-f A-F | tr -d ' ')" ]; then
+  echo "ERROR: sysupdate keyring holds [$(echo $fprs)], expected exactly the release key $FOILBIRD_RELEASE_KEY_FPR" >&2; exit 1
+fi
+cmp -s "$k" "$BUILDROOT/usr/lib/systemd/import-pubring.pgp" || { echo "ERROR: import-pubring.gpg and .pgp differ" >&2; exit 1; }
+echo "release keyring: $(sha256sum "$k" | cut -c1-16) (import-pubring.gpg = .pgp)"
+# Public key of the PCR 11 policy signer (disk encryption, docs/disk-encryption.md): provided by the build (extra tree)
+p="$BUILDROOT/usr/lib/foilbird/pcr-key.pem"
+[ -s "$p" ] || { echo "ERROR: no PCR policy public key at /usr/lib/foilbird/pcr-key.pem" >&2; exit 1; }
+echo "PCR policy key: $(openssl pkey -pubin -in "$p" -outform der 2>/dev/null | sha256sum | cut -c1-16)"
+# Default release channel (images/debian/build-image.sh --channel, decision 0002): the agent's channel file and the
+# sysupdate.d sources must agree. A URL channel replaces every placeholder Path=; a directory channel or no channel leaves
+# them (the agent stages itself; NodeConfig.update_channel can name an https channel later).
+ch="$BUILDROOT/usr/lib/foil-agent/channel"; ph=https://updates.example.invalid/foilbird-deb/
+paths=$(awk '/^\[/{s=$0} s=="[Source]" && /^Path=/{sub(/^Path=/,""); print}' "$BUILDROOT"/usr/lib/sysupdate.d/*.transfer | sort -u)
+if [ -s "$ch" ]; then
+  c=$(head -n 1 "$ch")
+  case "$c" in
+    https://*/|http://*/) [ "$paths" = "$c" ] || { echo "ERROR: channel $c, but sysupdate.d sources are [$(echo $paths)]" >&2; exit 1; } ;;
+    /*) [ "$paths" = "$ph" ] || { echo "ERROR: directory channel $c, sysupdate.d sources must stay the placeholder, are [$(echo $paths)]" >&2; exit 1; } ;;
+    *) echo "ERROR: /usr/lib/foil-agent/channel: '$c' is neither a URL ending in / nor an absolute directory" >&2; exit 1 ;;
+  esac
+  echo "release channel: $c"
+else
+  [ "$paths" = "$ph" ] || { echo "ERROR: no /usr/lib/foil-agent/channel, but sysupdate.d sources are [$(echo $paths)]" >&2; exit 1; }
+  echo "release channel: none in the image (NodeConfig.update_channel)"
+fi
+# PCR epoch of this release and the minimum release that may still open /var once the node raised its floor
+# (docs/disk-encryption.md). In os-release, so they also land in the UKI .osrel and foil-var-epoch can read them from a
+# staged UKI checked against the signed SHA256SUMS. mkosi --environment=FOILBIRD_PCR_EPOCH=<n> FOILBIRD_MIN_VERSION=<n>
+case "${FOILBIRD_PCR_EPOCH:-}" in ''|*[!0-9]*) echo "ERROR: FOILBIRD_PCR_EPOCH not set or not a number" >&2; exit 1;; esac
+case "${FOILBIRD_MIN_VERSION:-}" in ''|*[!0-9]*) echo "ERROR: FOILBIRD_MIN_VERSION not set or not a number" >&2; exit 1;; esac
+# The floor must not reach below the epoch. Epochs and their first releases come from release-epochs (or, for
+# lab builds only, FOILBIRD_RELEASE_EPOCHS="<epoch>:<first>,..."; commas, since mkosi splits Environment= values at spaces). Needed: epoch listed, first <= version < first of the next
+# epoch, first <= FOILBIRD_MIN_VERSION <= version. Versions compare as in the agent and foil-var-epoch (version sort).
+v="${IMAGE_VERSION:-}"; [ -n "$v" ] || { echo "ERROR: IMAGE_VERSION not set" >&2; exit 1; }
+if [ -n "${FOILBIRD_RELEASE_EPOCHS:-}" ]; then tab=$(printf '%s\n' $(echo "$FOILBIRD_RELEASE_EPOCHS" | tr ',' ' ') | tr ':' ' '); src="FOILBIRD_RELEASE_EPOCHS"
+else tab=$(grep -vE '^[[:space:]]*(#|$)' "$SRCDIR/release-epochs"); src="release-epochs"; fi
+vle() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$1" ]; }   # $1 <= $2
+first=; next=; pe=; pf=
+while read -r e f; do
+  case "$e" in ''|*[!0-9]*) echo "ERROR: $src: bad epoch '$e'" >&2; exit 1;; esac
+  [ -n "$f" ] || { echo "ERROR: $src: epoch $e without a first release" >&2; exit 1; }
+  if [ -n "$pe" ]; then [ "$e" -gt "$pe" ] && vle "$pf" "$f" && [ "$pf" != "$f" ] || { echo "ERROR: $src: epochs and first releases must both increase ($pe $pf, $e $f)" >&2; exit 1; }; fi
+  [ -n "$first" ] && [ -z "$next" ] && next=$f
+  [ "$e" = "$FOILBIRD_PCR_EPOCH" ] && first=$f
+  pe=$e; pf=$f
+done <<EOF
+$tab
+EOF
+[ -n "$first" ] || { echo "ERROR: epoch $FOILBIRD_PCR_EPOCH is not in $src" >&2; exit 1; }
+vle "$first" "$v" || { echo "ERROR: release $v is older than the first release $first of epoch $FOILBIRD_PCR_EPOCH" >&2; exit 1; }
+[ -z "$next" ] || ! vle "$next" "$v" || { echo "ERROR: release $v belongs to a later epoch (it starts at $next), not to $FOILBIRD_PCR_EPOCH" >&2; exit 1; }
+vle "$first" "$FOILBIRD_MIN_VERSION" || { echo "ERROR: FOILBIRD_MIN_VERSION $FOILBIRD_MIN_VERSION is below the first release $first of epoch $FOILBIRD_PCR_EPOCH: a node raised to it would accept releases that cannot open /var" >&2; exit 1; }
+vle "$FOILBIRD_MIN_VERSION" "$v" || { echo "ERROR: FOILBIRD_MIN_VERSION $FOILBIRD_MIN_VERSION is above the release $v itself" >&2; exit 1; }
+echo "epoch check ($src): release $v, epoch $FOILBIRD_PCR_EPOCH from $first${next:+ to before $next}, min $FOILBIRD_MIN_VERSION: ok"
+# Product identity: ID=foilbird, ID_LIKE=debian, NAME and PRETTY_NAME "Foilbird OS". Debian's version fields
+# (VERSION_ID, VERSION, VERSION_CODENAME, DEBIAN_VERSION_FULL) stay: they name the base release, which scanners read
+# through ID_LIKE (Grype) and /etc/debian_version (Trivy), T13. Debian's URLs go (not Debian's support); IMAGE_* and
+# FOILBIRD_* lines stay. Converts only the tree's own Debian file (ID=debian, no ID_LIKE; a build host's os-release
+# carries another ID) and checks the result: VERSION_ID = the major of the tree's /etc/debian_version.
+# The same block is in images/debian/mkosi/mkosi.finalize and images/debian/tools/no-interpreters.finalize.
+foilbird_os_release() {
+  o="$1/usr/lib/os-release"
+  [ -f "$o" ] && [ ! -L "$o" ] || { echo "ERROR: $o is not a regular file" >&2; exit 1; }
+  if ! grep -qx 'ID=foilbird' "$o"; then
+    grep -qx 'ID=debian' "$o" && ! grep -q '^ID_LIKE=' "$o" || { echo "ERROR: $o is not Debian's: $(grep -m1 '^PRETTY_NAME=' "$o")" >&2; exit 1; }
+    { printf 'PRETTY_NAME="Foilbird OS"\nNAME="Foilbird OS"\nID=foilbird\nID_LIKE=debian\n'
+      grep -vE '^(PRETTY_NAME|NAME|ID|ID_LIKE|HOME_URL|SUPPORT_URL|BUG_REPORT_URL|PRIVACY_POLICY_URL)=' "$o" || true; } > "$o.new"
+    chmod 0644 "$o.new"; mv "$o.new" "$o"
+  fi
+  maj=$(cut -d. -f1 "$1/etc/debian_version")
+  grep -qx 'ID_LIKE=debian' "$o" && grep -qE "^VERSION_ID=\"?$maj\"?\$" "$o" \
+    || { echo "ERROR: $o: no ID_LIKE=debian or VERSION_ID is not $maj (/etc/debian_version $(cat "$1/etc/debian_version"))" >&2; exit 1; }
+  echo "os-release: $(grep -E '^(ID|ID_LIKE|NAME|VERSION_ID|IMAGE_ID|IMAGE_VERSION)=' "$o" | paste -sd' ')"
+}
+foilbird_os_release "$BUILDROOT"
+o="$BUILDROOT/usr/lib/os-release"; sed -i '/^FOILBIRD_PCR_EPOCH=/d; /^FOILBIRD_MIN_VERSION=/d' "$o"
+printf 'FOILBIRD_PCR_EPOCH=%s\nFOILBIRD_MIN_VERSION=%s\n' "$FOILBIRD_PCR_EPOCH" "$FOILBIRD_MIN_VERSION" >> "$o"
+echo "os-release: FOILBIRD_PCR_EPOCH=$FOILBIRD_PCR_EPOCH FOILBIRD_MIN_VERSION=$FOILBIRD_MIN_VERSION"
+# SBOM (CycloneDX) and third-party notices from the image root itself, into the image (/usr/share/foilbird/) and next
+# to it in the output directory. Last step of the last finalize script: mkosi runs a profile's mkosi.finalize before this
+# one, and only here the dpkg status is final (stanzas of RemovePackages= dropped above) and os-release has the epochs.
+# Fails on a dpkg package without a licence record. The tools come with a profile build (BuildSources= image-tools).
+if [ -f "$SRCDIR/image-tools/image-sbom.py" ]; then
+  python3 -I "$SRCDIR/image-tools/image-sbom.py" "$BUILDROOT" "$BUILDROOT/usr/share/foilbird" "$OUTPUTDIR"
+else
+  echo "image-sbom: no image-tools in this build (base image without a profile): no SBOM written"
+fi

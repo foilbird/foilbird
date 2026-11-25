@@ -1,0 +1,28 @@
+# apt-pin.lock: pinned files of apt-pin.conf, one line each: <kind> <set> <sha256> <size> <url>
+# apt lines: written by images/debian/tools/apt-pin.py lock from the verified chain; review the diff
+apt nvidia-driver d0d4ef986a44400f9db33c600ef33a985175e7cc63d805a10e1839c7a1e78f5f 4182 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/cuda-keyring_1.1-1_all.deb
+apt nvidia-driver ae7494b40450434fb4f1fe8785bac17389e39cdbfdd41796e008efd12709270f 84892290 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/firmware-nvidia-gsp_610.57.04-1_amd64.deb
+apt nvidia-driver 7a34471824d35bb494701331e8445dc5dc8730a296ce04e24d535b4d965ff8e0 7982434 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libcuda1_610.57.04-1_amd64.deb
+apt nvidia-driver c93e8876758c9dd048b7d314ffe881f48d90bb2fcdda9dfc09e8995dc25740a3 3255624 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libcudadebugger1_610.57.04-1_amd64.deb
+apt nvidia-driver bbef3b05242438e8b0b524bb2f1048430f83fdd00c657ab72790b41f168be948 2709684 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libnvcuvid1_610.57.04-1_amd64.deb
+apt nvidia-driver 24b04ea8f8334bc6c3663244ee5d2a799880fa84e4ebd6b499ad117dda4c59cd 264392 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libnvidia-cfg1_610.57.04-1_amd64.deb
+apt nvidia-driver 95133654f142a6666d8ac55ed8b7da6ded69e3a60450104ddb0a1e0b0640196a 228188 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libnvidia-encode1_610.57.04-1_amd64.deb
+apt nvidia-driver f7e1ca8aabfd2369c2489af830a50d350f7f5510dae3bdc8e0169c1d01007e5b 188408 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libnvidia-fbc1_610.57.04-1_amd64.deb
+apt nvidia-driver 52d76dd0ffb0745dafee5635f17e656b7f097b84b6c9b2c8cdf5ea294d6c9a88 26451090 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libnvidia-gpucomp_610.57.04-1_amd64.deb
+apt nvidia-driver 42296c5dd39f213f92497edad0e4696545f57d2339d9dcfb489934c650ebd5ba 764960 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libnvidia-ml1_610.57.04-1_amd64.deb
+apt nvidia-driver f65503d871430281970b258cea78e29764db06505fa70a06bae704bbe867021f 20248258 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libnvidia-nvvm4_610.57.04-1_amd64.deb
+apt nvidia-driver 84edd168e51a3605365a9bc57d153d984cd1040ddf70cf9c923d9d79849b0bcc 7678388 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libnvidia-nvvm704_610.57.04-1_amd64.deb
+apt nvidia-driver 9bf9ce20abfeb90ca690b1d82bca4ecf4de63e2c08ef849631e175dc2091d57b 149124 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libnvidia-opticalflow1_610.57.04-1_amd64.deb
+apt nvidia-driver b409e0e19a1a0bb47ee920e3640aa28b5226a953254cc93d1af55667c9cabf1a 133980 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libnvidia-pkcs11-openssl3_610.57.04-1_amd64.deb
+apt nvidia-driver 128dfd23d7fa3e1a8a20de1b4b642755850cae8a967ee01230b8b57872282a7f 2940708 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libnvidia-present_610.57.04-1_amd64.deb
+apt nvidia-driver f7dff527609236c639b3e51b228c21ff37c3a99ac8fd27ff54fb1fe5e649386a 8847576 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libnvidia-ptxjitcompiler1_610.57.04-1_amd64.deb
+apt nvidia-driver cb17a8b68d90423b04295d079dd3d7a8ee410f15258284149c9a4717c1206804 153556 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libnvidia-sandboxutils_610.57.04-1_amd64.deb
+apt nvidia-driver 34a6bef003cd0baa496e6587871c9d9d5df52577d5e16e51b93158832e272b02 27644462 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libnvidia-tileiras_610.57.04-1_amd64.deb
+apt nvidia-driver d35964c81e3d54fb7a784cf091ce46d1f1ea17c5bc92020c7871c53fd748bd2b 52299646 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/libnvoptix1_610.57.04-1_amd64.deb
+apt nvidia-driver 9877775db7bea3b4c9355f36cf9696395662fa5bb0e237c84fbda1661c0a4929 650128 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/nvidia-driver-cuda_610.57.04-1_amd64.deb
+apt nvidia-driver 1ac4a5fcd1ac3f70d123e61e1fdba8a68ed8b0154b2cbb641a8a2910d8f03136 17317672 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/nvidia-kernel-open-dkms_610.57.04-1_amd64.deb
+apt nvidia-driver 1f32dc28d850d7b168e61b7a25dcc996c17a551a2f8ae4f63cf40edadf1c48a1 148984 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/nvidia-kernel-support_610.57.04-1_amd64.deb
+apt nvidia-driver cfff88028166774384f3279958c558ddd8e4bdaa1c9670fb2760927e4db8a2ee 21446 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/nvidia-modprobe_610.57.04-1_amd64.deb
+apt nvidia-driver 7a8b2976d899cc80c7c5628c0dd6cb10abfcd155ae4f561a762146c36c028370 7829426 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/nvidia-opencl-icd_610.57.04-1_amd64.deb
+apt nvidia-driver d64091ea43efaf7c481b3840e3331b83f28c8ed065cdbaaf6d05c677ea711bb1 27036 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/nvidia-persistenced_610.57.04-1_amd64.deb
+apt nvidia-driver 173ff4ab35231a8e8af6e2800b80d125d47187bb3666ceb6084167b249acbd89 1102730 https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/nvidia-powerd_610.57.04-1_amd64.deb

@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Control plane v0: kubeadm init once, from the operator's init configuration and cluster CA (NodeConfig.k8s.init,
+# rendered to /run/foilbird/config). Later boots skip it (admin.conf exists, persistent like kubelet.conf).
+[Unit]
+Description=Initialize the Kubernetes control plane (kubeadm init, /run/foilbird/config/k8s.init)
+Wants=network-online.target
+After=network-online.target containerd.service foil-config.service foil-k8s-env.service time-sync.target
+Requires=containerd.service
+ConditionPathExists=/run/foilbird/config/k8s.init
+ConditionPathExists=!/etc/kubernetes/admin.conf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Owner policy (p.22): a synchronized clock before the first cluster operation; certificates have validity windows.
+ExecStartPre=/usr/bin/foil-agent wait-time-sync --timeout 120
+# The node-local API proxy of workers (127.0.0.1:6443) would take the apiserver's port; on later boots its socket
+# does not start (ConditionPathExists=!kube-apiserver manifest).
+ExecStartPre=-/usr/bin/systemctl stop foil-apiserver-proxy.socket foil-apiserver-proxy.service
+# kubeadm uses an existing CA: the operator's (the agent's sandbox cannot write /etc/kubernetes).
+ExecStartPre=/usr/bin/install -D -m 0644 /run/foilbird/config/k8s.ca.crt /etc/kubernetes/pki/ca.crt
+ExecStartPre=/usr/bin/install -D -m 0600 /run/foilbird/config/k8s.ca.key /etc/kubernetes/pki/ca.key
+# --skip-token-print: the bootstrap token is the operator's and must not reach the journal (CollectDiagnostics is not
+# redacted). Preflight checks that do not apply to this OS, as for the join.
+ExecStart=/usr/bin/kubeadm init --config=/run/foilbird/config/k8s.init --skip-token-print --ignore-preflight-errors=SystemVerification,FileExisting-conntrack,FileExisting-socat,FileExisting-ethtool,FileExisting-tc,FileExisting-ebtables,FileExisting-ip
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

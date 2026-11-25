@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# Node-local Kubernetes API endpoint 127.0.0.1:6443 -> apiServerEndpoint of k8s.join. Clusters set up by kubespray (and
+# others with a node-local API load balancer) point in-cluster agents at localhost:6443 (e.g. Cilium with
+# KUBERNETES_SERVICE_HOST=localhost); without this the CNI agent never reaches the API server. TLS is passed through.
+[Unit]
+Description=Node-local Kubernetes API endpoint
+# not on a control plane: the local kube-apiserver listens on :6443 (foil-kubeadm-init stops it on the first boot)
+ConditionPathExists=!/etc/kubernetes/manifests/kube-apiserver.yaml
+
+[Socket]
+ListenStream=127.0.0.1:6443
+
+[Install]
+WantedBy=sockets.target

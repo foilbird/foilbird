@@ -1,0 +1,10 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Build overlay only: compile the initrd helpers against the initrd's libc (inside the build overlay root, as
+# ../recovery/mkosi.build does) and install them into /usr/libexec. No shell in the initrd.
+set -euo pipefail
+if [ -z "${NR_IN_CHROOT:-}" ]; then
+  exec mkosi-chroot env NR_IN_CHROOT=1 SRCDIR="$CHROOT_SRCDIR" DESTDIR="$CHROOT_DESTDIR" "$CHROOT_SCRIPT" "$@"
+fi
+mkdir -p "$DESTDIR/usr/libexec"
+gcc -O2 -Wall -Wextra -Werror -o "$DESTDIR/usr/libexec/foil-machine-id" "$SRCDIR/tools/foil-machine-id.c"

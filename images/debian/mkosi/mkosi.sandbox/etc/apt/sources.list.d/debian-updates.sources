@@ -1,0 +1,7 @@
+# <release>-updates from the same snapshot as reproducible.conf Snapshot= (mkosi 26 adds this suite only without a
+# snapshot). Written by tools/snapshot set; checked by tools/snapshot check before every build.
+Types: deb
+URIs: https://snapshot.debian.org/archive/debian/20261120T000000Z
+Suites: trixie-updates
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg

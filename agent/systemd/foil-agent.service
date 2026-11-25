@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Node agent API (foilbird)
+Documentation=https://github.com/foilbird/foilbird/tree/main/api
+After=foil-config.service network.target dbus.socket
+Wants=foil-config.service
+# Never give up restarting (the API is the only way to the node): no start rate limit. [Unit] only; in [Service]
+# systemd ignores it with a warning.
+StartLimitIntervalSec=0
+
+[Service]
+# PoC: no shell on the node; the console is the only log channel besides the API.
+StandardOutput=journal+console
+StandardError=journal+console
+Type=exec
+ExecStart=/usr/bin/foil-agent serve --listen [::]:7443
+# TLS material: systemd credentials; /boot/loader/foilbird only in a lab build
+# (feature esp-bridge-tls); node certificate from registration later.
+ImportCredential=agent.tls-*
+Restart=always
+# a panic aborts the agent (panic = "abort"): restart after 2 s, the delay grows over 5 restarts up to 60 s (systemd >= 254)
+RestartSec=2
+RestartSteps=5
+RestartMaxDelaySec=60
+StateDirectory=foil-agent
+StateDirectoryMode=0700
+# Runs as root without capabilities: reads root-owned files, writes
+# /run/foilbird, /run/systemd/network and the timesyncd drop-in, talks to systemd over D-Bus.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run/foilbird -/run/systemd/network -/run/systemd/timesyncd.conf.d
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+# no: with its own UTS namespace the agent would report a stale host name
+# after hostnamed changes it (it cannot change it itself: no capabilities)
+ProtectHostname=no
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# adjtimex(2) read-only query for the time-synced check (no CAP_SYS_TIME).
+SystemCallFilter=@system-service adjtimex
+SystemCallFilter=~@resources
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

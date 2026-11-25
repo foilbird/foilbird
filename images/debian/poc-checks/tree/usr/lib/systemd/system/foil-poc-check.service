@@ -1,0 +1,8 @@
+[Unit]
+Description=Debian variant boot check (PoC)
+After=multi-user.target
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/foil-poc-check
+[Install]
+WantedBy=multi-user.target

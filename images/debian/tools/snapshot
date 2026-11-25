@@ -1,0 +1,30 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# The Debian snapshot timestamp of the build (docs/reproducible-build.md). It is written in three places that must
+# agree: reproducible.conf (Snapshot=, read by mkosi for the image, the initrd and the recovery UKI), tools-tree/mkosi.conf
+# (Snapshot= of mkosi's default tools tree, which mkosi 26 does not inherit; read through mkosi.tools.conf of every build
+# directory) and the <release>-updates source of the build sandbox (mkosi/mkosi.sandbox/.../debian-updates.sources).
+#   snapshot check        all three name the same timestamp (every build entry runs it); prints it
+#   snapshot set <ts>     write <ts> (YYYYMMDDTHHMMSSZ, as snapshot.debian.org names its runs) into all three
+# Exit: 0 ok, 1 mismatch or bad timestamp, 2 usage.
+set -eu
+here=$(cd "$(dirname "$0")/.." && pwd)
+conf=$here/reproducible.conf; tools=$here/tools-tree/mkosi.conf; src=$here/mkosi/mkosi.sandbox/etc/apt/sources.list.d/debian-updates.sources
+valid() { printf '%s\n' "$1" | grep -qxE '[0-9]{8}T[0-9]{6}Z'; }
+conf_ts() { sed -n 's/^Snapshot=//p' "$conf"; }
+tools_ts() { sed -n 's/^Snapshot=//p' "$tools"; }
+src_ts() { sed -n 's#^URIs: https://snapshot\.debian\.org/archive/debian/\([^/ ]*\)/*$#\1#p' "$src"; }
+case ${1:-} in
+check)
+  a=$(conf_ts); b=$(src_ts); t=$(tools_ts)
+  valid "$a" || { echo "snapshot: reproducible.conf Snapshot=[$a] is not a snapshot timestamp" >&2; exit 1; }
+  [ "$a" = "$b" ] || { echo "snapshot: reproducible.conf Snapshot=$a, debian-updates.sources $b: run tools/snapshot set <ts>" >&2; exit 1; }
+  [ "$a" = "$t" ] || { echo "snapshot: reproducible.conf Snapshot=$a, tools-tree/mkosi.conf [$t]: run tools/snapshot set <ts>" >&2; exit 1; }
+  echo "$a" ;;
+set)
+  ts=${2:-}; valid "$ts" || { echo "snapshot set: <ts> must look like 20261120T000000Z" >&2; exit 2; }
+  sed -i "s/^Snapshot=.*/Snapshot=$ts/" "$conf" "$tools"
+  sed -i "s#^URIs: https://snapshot\.debian\.org/archive/debian/.*#URIs: https://snapshot.debian.org/archive/debian/$ts#" "$src"
+  "$0" check ;;
+*) sed -n '2,8p' "$0" >&2; exit 2 ;;
+esac

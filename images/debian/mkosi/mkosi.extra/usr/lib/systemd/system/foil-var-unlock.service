@@ -1,0 +1,34 @@
+# Open /var with the TPM. headless: no passphrase prompt and no fallback; a node that fails the TPM policy (other
+# Secure Boot state, image not signed by the PCR key, reset TPM) does not get /var (docs/disk-encryption.md).
+[Unit]
+Description=Unlock /var (LUKS2, TPM2: PCR 7 + signed PCR 11)
+DefaultDependencies=no
+Wants=foil-repart.service
+After=foil-repart.service tpm2.target systemd-tpm2-setup-early.service dev-disk-by\x2dpartlabel-var.device
+Requires=dev-disk-by\x2dpartlabel-var.device
+# only for an encrypted var partition; a plain one (disk set up before /var encryption) is mounted as is
+ConditionPathExists=/dev/disk/foilbird/var-luks
+Before=var.mount cryptsetup.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=90
+# One TPM2 token per PCR key epoch (docs/disk-encryption.md). systemd-cryptsetup (257) stops after the first systemd-tpm2
+# token that has no signature for its key (ENXIO) and never tries the next one, so with two epochs enrolled only the
+# first would unlock. Try the tokens one by one (same systemd-tpm2 token plugin, no prompt); the last line is the verdict.
+# Ids 0-7, not just one per live epoch: a power loss while a keyslot is wiped can leave its token behind with no
+# keyslot, and cryptenroll gives the next enrolled token the next free id. No shell (profiles may have none).
+ExecStart=-/usr/sbin/cryptsetup open --token-only --token-id 0 /dev/disk/by-partlabel/var var
+ExecStart=-/usr/sbin/cryptsetup open --token-only --token-id 1 /dev/disk/by-partlabel/var var
+ExecStart=-/usr/sbin/cryptsetup open --token-only --token-id 2 /dev/disk/by-partlabel/var var
+ExecStart=-/usr/sbin/cryptsetup open --token-only --token-id 3 /dev/disk/by-partlabel/var var
+ExecStart=-/usr/sbin/cryptsetup open --token-only --token-id 4 /dev/disk/by-partlabel/var var
+ExecStart=-/usr/sbin/cryptsetup open --token-only --token-id 5 /dev/disk/by-partlabel/var var
+ExecStart=-/usr/sbin/cryptsetup open --token-only --token-id 6 /dev/disk/by-partlabel/var var
+ExecStart=-/usr/sbin/cryptsetup open --token-only --token-id 7 /dev/disk/by-partlabel/var var
+ExecStart=/usr/bin/test -b /dev/mapper/var
+ExecStop=/usr/sbin/cryptsetup close var
+StandardOutput=journal+console
+StandardError=journal+console

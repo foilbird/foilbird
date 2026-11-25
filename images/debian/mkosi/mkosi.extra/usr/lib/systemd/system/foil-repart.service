@@ -1,0 +1,29 @@
+# First boot repartitioning on the host with an explicit TPM2 policy for /var (docs/disk-encryption.md).
+# Runs only on a fresh installation: while the boot disk has no /var partition (label var, written in the same repart run
+# as slot B and the state partition). Every definition is required there: a disk without room for all of them, the
+# state partition included, fails this unit and the installation (no /var), never a silently smaller layout (as
+# Talos does). A node installed before the state partition existed has /var: the unit is skipped and the layout is left
+# as it is (no migration, docs/updates.md). The link is created by udev in the initrd already (it carries over the
+# switch to the host) and foil-var-unlock.service depends on the same link.
+# --seed=random: by default repart derives partition UUIDs from the machine-id. With a stable machine-id the /var UUID
+# then matches what systemd-gpt-auto-generator looks for, and it adds its own systemd-cryptsetup@var.service, which
+# races with foil-var-unlock and fails (dev-mapper-var.device depends on it). Seen on Debian 257, 15.11.
+[Unit]
+Description=First boot: create slot B and the TPM-bound /var
+DefaultDependencies=no
+ConditionVirtualization=!container
+ConditionPathExists=!/dev/disk/by-partlabel/var
+Wants=tpm2.target
+After=tpm2.target systemd-tpm2-setup-early.service systemd-udev-trigger.service
+Before=foil-var-unlock.service shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# TPM2 policy: keep equal to ENROLL_PCRS / ENROLL_PUBKEY_PCRS in tools/foil-var-epoch.c (raise keeps only a token with it)
+ExecStart=/usr/bin/systemd-repart --dry-run=no --seed=random --definitions=/usr/lib/foilbird/repart.d --tpm2-device=auto --tpm2-pcrs=7 --tpm2-public-key=/usr/lib/foilbird/pcr-key.pem --tpm2-public-key-pcrs=11
+SuccessExitStatus=76 77
+TimeoutStartSec=300
+StandardOutput=journal+console
+StandardError=journal+console

@@ -1,0 +1,16 @@
+# Record the /var protection in PCR 15 ("foilbird-var:luks-tpm2"), so remote attestation sees a plain or downgraded /var
+# (docs/disk-encryption.md). The node agent reports the same state (var_protection).
+[Unit]
+Description=Measure the /var protection (luks-tpm2) into PCR 15
+DefaultDependencies=no
+ConditionPathExists=/dev/disk/foilbird/var-luks
+ConditionSecurity=measured-uki
+After=var.mount tpm2.target
+Requires=var.mount
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/systemd/systemd-pcrextend --pcr=15 foilbird-var:luks-tpm2

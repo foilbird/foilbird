@@ -1,0 +1,45 @@
+#!/bin/bash
+# Debian variant boot check (PoC): facts + tests to the console and /boot/foil-poc-check.log, then power off.
+esp=/boot; log=/dev/null; mountpoint -q $esp && log=$esp/foil-poc-check.log
+exec > >(tee -a "$log" >/dev/console) 2>&1
+echo "=== POC-CHECK BEGIN ==="
+echo "--- os/kernel/cmdline"; grep -E '^(PRETTY_NAME|VERSION_ID)=' /usr/lib/os-release; echo "debian_version=$(cat /etc/debian_version 2>&1)"; uname -r; cat /proc/cmdline
+echo "--- lockdown / sig_enforce"; cat /sys/kernel/security/lockdown; echo "sig_enforce=$(cat /sys/module/module/parameters/sig_enforce 2>&1)"
+echo "--- bootctl"; bootctl status --no-pager 2>&1 | grep -iE 'secure boot|setup mode|tpm2|measured uki'
+echo "--- keyrings: certs loaded by the kernel (builtin, db -> .platform, MOK -> .machine)"
+dmesg | grep -iE 'Loaded X.509 cert|integrity:|Loading compiled-in X.509|platform keyring|machine keyring' | head -20
+echo "--- /usr mount"; grep -E ' /usr ' /proc/mounts; dmsetup table usr 2>&1 | cut -c1-120 | head -1
+echo "--- forbidden software in /usr (package managers, interpreters, remote shells, build tools; docs/image-policy.md)"
+bad=$(find /usr -xdev \( -name 'apt*' -o -name 'dpkg*' -o -name 'perl*' -o -name 'python3*' -o -name 'ssh' -o -name 'sshd' -o -name 'curl' -o -name 'wget' -o -name 'gcc*' -o -name 'cc' -o -name 'make' -o -name 'dkms' -o -name 'snap*' -o -name 'cloud-init*' -o -name 'netplan*' \) \
+  \( -type f -o -type l \) -not -path '/usr/lib/modules/*' -not -path '/usr/share/locale/*' -not -path '/usr/share/doc/*' -not -path '/usr/share/man/*' -not -path '/usr/lib/firmware/*' 2>/dev/null)
+echo "forbidden-count=$(echo -n "$bad" | grep -c .)"; echo "$bad" | head -20
+ls -d /usr/src/* /usr/lib/modules/*/build 2>&1 | head -3
+echo "--- SBOM record of DKMS modules"; grep -E '"(component|version|kernel|package|origin)"' /usr/share/foilbird/sbom/*.json 2>&1 | head -6
+echo "--- dpkg status for scanners"; ls -la /var/lib/dpkg/status; grep -c '^Package:' /var/lib/dpkg/status
+grep --after-context=1 -E '^Package: (linux-image-[0-9].*|nvidia-driver-cuda|firmware-nvidia-gsp|systemd)$' /var/lib/dpkg/status | grep -E '^(Package|Version)' | paste - -
+echo "--- signers"
+for m in $(modprobe -n -v nvidia 2>/dev/null | sed -n 's/^insmod \([^ ]*\).*/\1/p') $(modinfo -n ext4 2>/dev/null); do echo "$m signer=[$(modinfo -F signer $m)]"; done
+for f in /usr/lib/foil-poc-check/*.ko; do echo "$(basename $f) signer=[$(modinfo -F signer $f)]"; done
+t9() { insmod /usr/lib/foil-poc-check/$1.ko; rc=$?; if grep -q '^t9 ' /proc/modules; then st=loaded; rmmod t9; else st=not-loaded; fi; echo "T9-$1 insmod-exit=$rc state=$st"; }
+echo "--- T9a: unsigned module -> refused"; t9 t9-unsigned
+echo "--- T9b: module signed with a foreign key -> refused"; t9 t9-other
+echo "--- T9c: module signed with our db key -> loaded (db cert trusted for modules via .platform)"; t9 t9-db
+dmesg | grep -iE 't9|Loading of unsigned|module verification|Key was rejected|Loading of module with unavailable key' | tail -6
+echo "--- modprobe nvidia (our db signature must pass; without GPU: No such device)"; modprobe nvidia; echo "modprobe-exit=$?"
+dmesg | grep -iE 'NVRM|nvidia|Key was rejected' | tail -5
+grep -E '^nvidia' /proc/modules | cut -d' ' -f1
+modprobe nvidia_uvm; echo "modprobe-uvm-exit=$?"; grep -E '^nvidia' /proc/modules | cut -d' ' -f1 | tr '\n' ' '; echo
+echo "--- nvidia-smi"; command -v nvidia-smi; nvidia-smi -L 2>&1 | head -3
+nvidia-smi --query-gpu=name,driver_version,memory.total,ecc.mode.current,pci.bus_id --format=csv 2>&1 | head -3; nvidia-smi 2>&1 | grep -E 'CUDA Version' | head -1
+echo "--- CUDA init (driver API, no load)"; /usr/lib/foil-poc-check/cuda-init; echo "cuda-init-exit=$?"
+echo "--- PCI NVIDIA"; for d in /sys/bus/pci/devices/*; do [ "$(cat $d/vendor)" = 0x10de ] && echo "${d##*/} $(cat $d/vendor):$(cat $d/device) class=$(cat $d/class) driver=$(basename "$(readlink $d/driver 2>/dev/null)" 2>/dev/null)"; done
+echo "--- nvidiafb/nouveau blacklist"; modprobe nvidiafb; echo "modprobe-nvidiafb-exit=$?"; modprobe nouveau; echo "modprobe-nouveau-exit=$?"; dmesg | grep -c nouveau | sed "s/^/nouveau-dmesg-lines=/"; grep -E '^(nvidiafb|nouveau) ' /proc/modules && echo BLACKLIST=FAIL || echo BLACKLIST=PASS
+echo "--- full read of /dev/mapper/usr"
+dev=; for d in /sys/block/dm-*; do [ "$(cat $d/dm/name 2>/dev/null)" = usr ] && dev=/dev/${d##*/}; done
+dd if="$dev" of=/dev/null bs=4M status=none && echo usr-read=ok || echo usr-read=FAILED
+echo "--- /etc from factory"; ls -la /etc/netconfig 2>&1; grep -c "^unix" /etc/netconfig 2>&1 | sed "s/^/netconfig-unix-lines=/"; ls /etc/alternatives 2>/dev/null | wc -l | sed "s/^/alternatives=/"; systemctl is-active systemd-tmpfiles-setup.service
+echo "--- nvidia-persistenced"; getent passwd nvidia-persistenced; systemctl show nvidia-persistenced -p ActiveState,SubState,Result,ConditionResult --no-pager; nvidia-smi -q 2>/dev/null | grep -i "Persistence Mode"
+echo "--- failed units"; systemctl --failed --no-legend --no-pager --plain; echo "failed-count=$(systemctl --failed --no-legend --no-pager --plain | grep -c .)"
+for u in $(systemctl --failed --no-legend --no-pager --plain | cut -d' ' -f1); do echo "##### $u"; journalctl -b -u "$u" --no-pager 2>&1 | tail -8; done
+echo "--- boot time"; systemd-analyze 2>&1 | head -2
+echo "=== POC-CHECK END ==="; sync; sleep 1; systemctl poweroff

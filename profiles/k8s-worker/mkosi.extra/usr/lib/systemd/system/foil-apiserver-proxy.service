@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Node-local Kubernetes API endpoint (proxy to the API server)
+Requires=foil-apiserver-proxy.socket foil-k8s-env.service
+After=foil-apiserver-proxy.socket foil-k8s-env.service
+
+[Service]
+EnvironmentFile=/run/foilbird/apiserver.env
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd ${FOILBIRD_APISERVER}
+DynamicUser=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=

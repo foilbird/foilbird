@@ -1,0 +1,33 @@
+# Operator rollback of a committed release (the agent's Rollback RPC). Started by the node agent over D-Bus
+# (StartUnit "foil-rollback@<version>.service", result from JobRemoved) after its own checks: <version> is the booted
+# release, the previous release's UKI and /usr partitions are on the disk and it is not below the anti-rollback floor.
+# The unit checks again what it can without a shell and takes the booted entry out of systemd-boot's choice: the
+# committed entry foilbird-deb_<v>.efi (no counter, bless removed it; no re-arm) becomes foilbird-deb_<v>+0.efi, a "bad"
+# entry (no tries left), so systemd-boot boots the newest good entry, the previous release (boot-assessment.md). Nothing
+# else changes: the previous entry keeps its own name (committed: no counter, booted as it is; one installed by an older
+# image with re-arm: "+3", counted and blessed on its first good boot); systemd-boot never falls back to the abandoned
+# one. The agent never writes the ESP.
+[Unit]
+Description=Abandon committed release %I (operator rollback)
+# /boot is not in RequiresMountsFor= (no Requires=boot.mount): the ESP is an automount unmounted after 60 s idle
+# (boot.automount.d/50-foil-esp.conf), and its expiry queues a stop job for boot.mount that would cancel this unit's
+# start job through Requires= (seen with foil-install@ in CI: "job canceled" 77 s after the start). The paths under /boot trigger the automount when used; a file held open keeps the ESP
+# mounted. docs/boot-assessment.md (ESP); the build fails on a /boot requirement (mkosi.finalize).
+RequiresMountsFor=/var/lib/foilbird
+Wants=boot.automount
+After=boot.automount
+
+[Service]
+Type=oneshot
+# only the booted release (%A = IMAGE_VERSION of the booted /usr) and only once it is committed
+ExecStartPre=/usr/bin/test "%A" = "%I"
+ExecStartPre=/usr/bin/test -e /var/lib/foilbird/committed/%I
+# the committed entry (no counter); a still-counting entry (+2-1 ...) is left to systemd-boot's own rollback
+ExecStartPre=/usr/bin/test -e /boot/EFI/Linux/foilbird-deb_%I.efi
+# same lock as the installer: no rename while sysupdate writes the ESP; an install takes up to 45 min, so wait at most
+# 30 s and fail ("installer busy") instead of running into TimeoutStartSec
+ExecStart=/usr/bin/flock -w 30 /run/foil-install.lock /usr/bin/mv -T /boot/EFI/Linux/foilbird-deb_%I.efi /boot/EFI/Linux/foilbird-deb_%I+0.efi
+ExecStart=/usr/bin/sync -f /boot/EFI/Linux/foilbird-deb_%I+0.efi
+TimeoutStartSec=2min
+StandardOutput=journal+console
+StandardError=journal+console

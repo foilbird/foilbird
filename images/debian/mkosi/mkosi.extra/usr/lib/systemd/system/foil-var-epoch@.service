@@ -1,0 +1,17 @@
+# docs/disk-encryption.md: key slots of the TPM-bound /var per PCR-signing epoch. The node agent starts
+# "foil-var-epoch@enroll-<version>.service" (staged release, before it is installed) and
+# "foil-var-epoch@raise-<version>.service" (booted, committed release) over D-Bus and reads the result from
+# JobRemoved and /run/foilbird/var-epoch/<op>-<version>.result. The agent passes only the version: key, epoch and floor
+# come from the release itself, the staged one checked against SHA256SUMS signed by the release key in /usr.
+[Unit]
+Description=TPM /var key slots: %I
+RequiresMountsFor=/var
+After=foil-var-unlock.service var.mount
+
+[Service]
+Type=oneshot
+# %I: the agent passes the instance systemd-escaped (+ -> \x2b); %I is the unescaped form. One operation at a time.
+ExecStart=/usr/bin/flock /run/foil-var-epoch.lock /usr/libexec/foil-var-epoch %I
+TimeoutStartSec=5min
+StandardOutput=journal+console
+StandardError=journal+console

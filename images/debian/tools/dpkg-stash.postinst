@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Initrd and recovery (PostInstallationScripts=): keep the dpkg database as a data file for scanners (T13), as the image
+# does (../mkosi/mkosi.postinst): /usr/lib/foilbird/dpkg/status, taken before RemovePackages=/CleanPackageMetadata wipe
+# /var/lib/dpkg. The file lists of the packages go to a build-only stash; no-interpreters.finalize uses them to drop the
+# stanzas of packages that have no file left (a phantom entry gives false findings) and deletes the stash.
+set -eu
+[ "$1" = final ] || exit 0
+d="$BUILDROOT/usr/lib/foilbird/dpkg"; mkdir -p "$d" "$BUILDROOT/.foilbird-dpkg-lists"
+cp "$BUILDROOT/var/lib/dpkg/status" "$d/status"
+cp "$BUILDROOT"/var/lib/dpkg/info/*.list "$BUILDROOT/.foilbird-dpkg-lists/"
+echo "dpkg status: $(grep -c '^Package:' "$d/status") packages stashed"

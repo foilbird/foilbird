@@ -1,0 +1,12 @@
+# Frozen surface of foilbird/agent/discovery.proto (ADR 0016), checked by api/tools/check_proto.py: every line must stay
+# exactly as it is in the .proto; a new field is a new line. Never edit or remove a line. Frozen for good from the first
+# public release on: names, numbers, types and labels of the fields and the shape of the service. The package name is
+# not listed: it follows the project prefix and may change once, with the prefix, before the first public release.
+#   service <Service> <rpc> <Request> <Response>
+#   field <Message> <name> <number> <label> <type>      (label: single | repeated)
+#   reserved <Message> <number|"name">
+service Discovery GetApiVersions GetApiVersionsRequest GetApiVersionsResponse
+field GetApiVersionsResponse agent_version 1 single string
+field GetApiVersionsResponse served_apis 2 repeated string
+reserved GetApiVersionsResponse 3
+reserved GetApiVersionsResponse "capabilities"

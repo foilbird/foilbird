@@ -1,0 +1,17 @@
+# Commit marker of a release, independent of the UKI name (a committed release is "<v>.efi"; one re-armed by an older
+# image is "+3" and shows "+2-1", "+1-2" … while it boots, like a new one). Written once, on the first boot of the release that passed the
+# health gate (systemd-bless-boot runs only after boot-complete.target): /var/lib/foilbird/committed/<IMAGE_VERSION>, an
+# empty file whose mtime is the commit time. Read by foil-var-epoch (raise) and the node agent.
+[Unit]
+Description=Record that the booted release is committed
+Requires=systemd-bless-boot.service
+After=systemd-bless-boot.service
+RequiresMountsFor=/var
+ConditionPathExists=!/var/lib/foilbird/committed/%A
+
+[Service]
+Type=oneshot
+StateDirectory=foilbird/committed
+ExecStart=/usr/bin/touch /var/lib/foilbird/committed/%A
+ExecStart=/usr/bin/sync -f /var/lib/foilbird/committed/%A
+StandardOutput=journal+console

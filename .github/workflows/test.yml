@@ -1,0 +1,123 @@
+# SPDX-License-Identifier: Apache-2.0
+# Test harness on a hosted runner: `make test-container` (tests/README.md) inside debian:trixie with KVM.
+#
+# Runs only on a push to a ci/t-* branch (a run against an image given by URL, or the self-check): such a branch is made
+# on purpose for one run, so pushing the work branches never starts a job. The harness gate itself (images built in the job,
+# make test STRICT=1) is STAGE=harness of build.yml on ci/harness-try-*. The run's inputs are the env block below, set in the commit of that branch. Without IMAGE_URL the
+# job runs the harness self-check only (tools, OVMF, KVM, keys, swtpm, virt-fw-vars enrollment).
+# No secrets, no third-party actions (run: steps only); the token is read-only and used only to fetch this commit.
+
+name: test
+
+on:
+  push:
+    branches: [ "ci/t-*" ]
+
+permissions:
+  contents: read
+
+env:
+  ENGINE: docker
+  DEBIAN_IMAGE: debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6
+  # Inputs of a harness run (empty = self-check only). The image may be .raw or .raw.zst.
+  IMAGE_URL: ""
+  IMAGE_SHA256: ""
+  FOILCTL_URL: ""
+  FOILCTL_SHA256: ""
+  VERSION: ""
+  ENROLL: auto
+  SCENARIOS: ""
+  # Guests sized for the private runner (2 vCPU, 7 GiB RAM, ~37 GiB disk after cleanup; Secure Boot boot ~17 s):
+  # one guest at a time, memory left for the container and the host; no CPU pinning.
+  VM_MEM: 3G
+  VM_SMP: "2"
+  API_TIMEOUT: "600"
+  SETTLE: "60"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  harness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Source (this commit only)
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q src && cd src
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY"
+          auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
+          git -c http.extraHeader="AUTHORIZATION: basic $auth" fetch -q --depth 1 origin "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='%H %s'
+
+      - name: Publication rules without a word list (tests/compliance/oss-gate.py, gitleaks-gate.sh; before anything else)
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd src
+          # the history without trees (commit ids only) for the old-hashes rule
+          auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
+          git -c http.extraHeader="AUTHORIZATION: basic $auth" fetch -q --unshallow --filter=tree:0 origin \
+            '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'
+          python3 -I tests/compliance/oss-gate.py --selftest --history --own "$GITHUB_REPOSITORY" | tee "$RUNNER_TEMP/oss-gate.txt"
+          { echo '```'; cat "$RUNNER_TEMP/oss-gate.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          sh tests/compliance/gitleaks-gate.sh | tee "$RUNNER_TEMP/gitleaks-gate.txt"
+          { echo '```'; cat "$RUNNER_TEMP/gitleaks-gate.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: KVM for the runner user
+        run: |
+          set -euo pipefail
+          [ -e /dev/kvm ] || { echo "no /dev/kvm on this runner"; exit 1; }
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm-harness.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Self-check (container)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/self"
+          WORK="$RUNNER_TEMP/self" src/tests/container.sh --selfcheck
+
+      - name: Inputs
+        if: env.IMAGE_URL != ''
+        run: |
+          set -euo pipefail
+          in="$RUNNER_TEMP/in"; mkdir -p "$in"
+          get() { # get <url> <sha256> <file>
+            [ -n "$2" ] || { echo "sha256 missing for $1"; exit 1; }
+            curl -fsSL --retry 3 -o "$3" "$1"
+            echo "$2  $3" | sha256sum -c -
+          }
+          case $IMAGE_URL in
+            *.zst) get "$IMAGE_URL" "$IMAGE_SHA256" "$in/image.raw.zst"; zstd -q -d --rm "$in/image.raw.zst" -o "$in/image.raw" ;;
+            *) get "$IMAGE_URL" "$IMAGE_SHA256" "$in/image.raw" ;;
+          esac
+          get "$FOILCTL_URL" "$FOILCTL_SHA256" "$in/foilctl"; chmod 0755 "$in/foilctl"
+          df -h "$RUNNER_TEMP"
+
+      - name: Harness (container)
+        if: env.IMAGE_URL != ''
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/work"
+          cd src
+          IMAGE="$RUNNER_TEMP/in/image.raw" FOILCTL="$RUNNER_TEMP/in/foilctl" WORK="$RUNNER_TEMP/work" \
+            VERSION="$VERSION" ENROLL="$ENROLL" make test-container SCENARIOS="$SCENARIOS"
+
+      - name: Results
+        if: always()
+        run: |
+          for f in "$RUNNER_TEMP/self/results.txt" "$RUNNER_TEMP/work/results.txt"; do
+            [ -f "$f" ] || continue
+            { echo '```'; cat "$f"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            cat "$f"
+          done
+          for f in "$RUNNER_TEMP"/work/logs/*/*.serial_tail.txt; do [ -f "$f" ] && { echo "--- $f"; cat "$f"; }; done
+          exit 0

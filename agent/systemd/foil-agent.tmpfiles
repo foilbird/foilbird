@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+d /run/foilbird 0755 root root -
+d /run/foilbird/config 0755 root root -
+d /run/systemd/network 0755 root root -
+d /run/systemd/timesyncd.conf.d 0755 root root -
+d /var/lib/foil-agent 0700 root root -

@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
+# Health gate of decision 0003. With a boot counter active, boot-complete.target
+# (and so systemd-bless-boot) is reached only if this unit succeeds; a failure
+# reboots, and after the last try systemd-boot falls back to the other slot.
+# WantedBy=multi-user.target runs it on committed entries too (no counter), so
+# the agent always reports a boot confirmation result.
+[Unit]
+Description=Health gate before boot-complete (foilbird)
+After=foil-config.service foil-agent.service dbus.socket
+Before=boot-complete.target
+
+[Service]
+# PoC: no shell on the node; the console is the only log channel besides the API.
+StandardOutput=journal+console
+StandardError=journal+console
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/foil-agent boot-check --timeout 300
+TimeoutStartSec=330
+FailureAction=reboot
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run/foilbird
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service adjtimex
+SystemCallFilter=~@resources
+SystemCallErrorNumber=EPERM
+
+[Install]
+RequiredBy=boot-complete.target
+WantedBy=multi-user.target

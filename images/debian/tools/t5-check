@@ -1,0 +1,73 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# T5: nothing on the host to log in with or to run a script with. Check only, never
+# removes anything (removal is RemoveFiles= of the profile). Runs on a tree: the image's $BUILDROOT in a finalize
+# script, an unpacked /usr (fsck.erofs --extract) or a node's / mounted read-only in a pod (busybox sh is enough).
+#   t5-check [ROOT]        ROOT defaults to $BUILDROOT; prints every finding, the last line is
+#                          "T5 shells=N interpreters=N login=N getty=N scripts=N total=N gate=[...] gated=N";
+#                          exit 1 when gated > 0
+#   T5_GATE="shells interpreters scripts"   categories that fail the check (default: all five); the others are
+#                          reported only (a build gate grows category by category: interpreters, then login/getty)
+# Categories (a file counts when it is an executable regular file or a symlink, dangling or not, under a bin, sbin
+# or libexec directory; getty units anywhere under lib/systemd or etc/systemd):
+#   shells        sh, ash, dash, bash, rbash, zsh, ksh, mksh, csh, tcsh, fish, busybox, sh.shared, klibc's sh
+#   interpreters  awk, mawk, gawk, nawk, original-awk, perl, perl5*, python*, lua*, luajit, tclsh*, wish*, ruby*, node,
+#                 nodejs, php*, guile*, expect
+#   login         agetty, getty, mingetty, login, su, sulogin, passwd, chsh, chfn, newgrp, sg, chpasswd, newusers,
+#                 vipw, vigr, and the PAM services of a console login (pam.d/login, su, su-l, sulogin, chsh, chfn,
+#                 passwd) in etc/pam.d or usr/lib/pam.d
+#   getty         getty units still pulled in: getty.target, getty@, serial-getty@, console-getty, container-getty in a
+#                 *.wants/ or *.requires/ directory (a link to /dev/null is a mask and does not count)
+#   scripts       executable "#!" files whose interpreter is in the tree (/bin, /sbin read as /usr/bin, /usr/sbin;
+#                 "#!/usr/bin/env X" looks for X in usr/bin, usr/sbin). Scripts whose interpreter is gone are dead: listed
+#                 under [dead-scripts] for information, not counted
+set -u
+R=${1:-${BUILDROOT:?ROOT or BUILDROOT}}
+R=${R%/}
+[ -d "$R/usr" ] || [ -d "$R/bin" ] || { echo "t5-check: $R has no usr/ or bin/" >&2; exit 2; }
+total=0
+bins() { find "$R" -xdev \( -type l -o -type f -perm /111 \) \( -path "$R/usr/bin/*" -o -path "$R/usr/sbin/*" \
+  -o -path "$R/usr/libexec/*" -o -path "$R/bin/*" -o -path "$R/sbin/*" -o -path "$R/usr/lib/klibc/bin/*" \
+  -o -path "$R/etc/alternatives/*" \) "$@" -print 2>/dev/null | sed "s|^$R||" | sort; }
+report() { # category, findings (one per line); not in a pipeline: the counters must survive (dash, busybox ash)
+  n=$(printf '%s' "$2" | grep -c .)
+  echo "[$1] $n"; [ "$n" -eq 0 ] || printf '%s\n' "$2" | sed 's/^/  /'
+  eval "$1=$n"; total=$((total + n))
+}
+x=$(bins \( -name sh -o -name ash -o -name dash -o -name bash -o -name rbash -o -name zsh -o -name ksh -o -name mksh \
+  -o -name csh -o -name tcsh -o -name fish -o -name busybox -o -name sh.shared \)); report shells "$x"
+x=$(bins \( -name awk -o -name mawk -o -name gawk -o -name nawk -o -name original-awk -o -name perl -o -name 'perl5*' \
+  -o -name 'python*' -o -name 'lua*' -o -name luajit -o -name 'tclsh*' -o -name 'wish*' -o -name 'ruby*' -o -name node \
+  -o -name nodejs -o -name 'php*' -o -name 'guile*' -o -name expect \)); report interpreters "$x"
+x=$(bins \( -name agetty -o -name getty -o -name mingetty -o -name login -o -name su -o -name sulogin -o -name passwd \
+    -o -name chsh -o -name chfn -o -name newgrp -o -name sg -o -name chpasswd -o -name newusers -o -name vipw -o -name vigr \)
+  for d in etc/pam.d usr/lib/pam.d; do for s in login su su-l sulogin chsh chfn passwd; do
+    { [ -e "$R/$d/$s" ] || [ -L "$R/$d/$s" ]; } && echo "/$d/$s"; done; done); report login "$x"
+x=$(find "$R/usr/lib/systemd" "$R/etc/systemd" "$R/lib/systemd" -xdev \( -path '*.wants/*' -o -path '*.requires/*' \) \
+  \( -name getty.target -o -name 'getty@*' -o -name 'serial-getty@*' -o -name 'console-getty*' -o -name 'container-getty@*' \) \
+  2>/dev/null | while IFS= read -r f; do [ "$(readlink "$f")" = /dev/null ] || echo "${f#"$R"}"; done | sort); report getty "$x"
+# interpreter of a "#!" line inside the tree: 0 = present
+interp_in_tree() { # $1 = interpreter path, $2 = first argument
+  t=$1; case $t in */env) t=$2; case $t in /*) ;; *) [ -e "$R/usr/bin/$t" ] || [ -e "$R/usr/sbin/$t" ] || [ -L "$R/usr/bin/$t" ]; return;; esac;; esac
+  case $t in /bin/*|/sbin/*) t=/usr$t;; esac
+  [ -e "$R$t" ] || [ -L "$R$t" ]
+}
+all=$(find "$R" -xdev -type f -perm /111 -size -1024k \( -path "$R/usr/*" -o -path "$R/etc/*" -o -path "$R/bin/*" -o -path "$R/sbin/*" \) \
+  2>/dev/null | while IFS= read -r f; do [ "$(head -c 2 "$f" 2>/dev/null)" = '#!' ] && echo "${f#"$R"} $(head -n 1 "$f" | cut -c 3- | tr -s ' ' | sed 's/^ //' | cut -c 1-60)"; done | sort)
+live=""; dead=""
+nl='
+'
+while IFS=' ' read -r f i a _; do
+  [ -n "$f" ] || continue
+  if interp_in_tree "$i" "${a:-}"; then live="$live$f $i${a:+ $a}$nl"; else dead="$dead$f $i${a:+ $a}$nl"; fi
+done <<E
+$all
+E
+report scripts "${live%"$nl"}"
+echo "[dead-scripts] $(printf '%s' "$dead" | grep -c .) (interpreter not in the tree; not counted)"; [ -z "$dead" ] || printf '%s' "$dead" | sed 's/^/  /'
+gate=${T5_GATE:-shells interpreters login getty scripts}; gated=0
+for c in $gate; do
+  case $c in shells|interpreters|login|getty|scripts) eval "gated=\$((gated + \$$c))";; *) echo "t5-check: unknown category $c in T5_GATE" >&2; exit 2;; esac
+done
+echo "T5 shells=$shells interpreters=$interpreters login=$login getty=$getty scripts=$scripts total=$total gate=[$gate] gated=$gated"
+[ "$gated" -eq 0 ]

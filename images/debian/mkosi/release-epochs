@@ -1,0 +1,5 @@
+# PCR key epochs of the releases (docs/disk-encryption.md): "<epoch> <first release of the epoch>".
+# A security release that raises the minimum starts a new epoch: append a line, never change one. mkosi.finalize refuses
+# a release whose version is outside its epoch's range or whose FOILBIRD_MIN_VERSION is below the first release of its epoch
+# (a node that raised its floor to it would let in a release that cannot open /var any more).
+1 0

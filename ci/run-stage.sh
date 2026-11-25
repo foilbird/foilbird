@@ -1,0 +1,616 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# The CI of the node image as one script: every CI (GitHub Actions .github/workflows/build.yml, GitLab .gitlab-ci.yml)
+# only calls it, so the build, its gates and its summary are the same wherever it runs (docs/reproducible-build.md,
+# docs/ci-gitlab.md).
+#
+#   ci/run-stage.sh step <name>     one step (a CI that shows steps separately: build.yml)
+#   ci/run-stage.sh <stage>         every step of a stage in order, stopping at the first failure (a CI with one job per
+#                                   stage: .gitlab-ci.yml)
+#
+# Stages (what each does: the header of .github/workflows/build.yml):
+#   selfcheck  preflight tag oss errexit agent host snapshot keyfacts initrd
+#   gate       preflight tag oss errexit                            (the publication rules and the errexit invariant only)
+#   lock       preflight tag oss keyfacts lock                      (fails on purpose: the locks are reviewed and committed)
+#   cp | gpu   preflight tag oss agent disk host snapshot keyfacts image  (image only after a passing agent step)
+#   harness    preflight tag oss agent disk host snapshot keyfacts image harness_rel harness_test  (the harness gate:
+#              make test STRICT=1 against releases 1-4 built in the job; tag harness-try-*)
+# Steps: preflight tag oss errexit agent disk host snapshot keyfacts initrd lock image harness_rel harness_test result
+# Every step runs in a process of its own (`bash ci/run-stage.sh __step <name>`, started by run_step): a step body called
+# from `"step_x" || rc=$?` (or under if/&&/!) runs with errexit ignored - its own `set -e` would do nothing (bash(1)) - so
+# a step never runs inside such a context; what a step decides on is still read explicitly (rc, PIPESTATUS, exit).
+# The child gets the state through the environment only: CI_TMP, CI_SUMMARY, STAGE, CI_TAG_GLOB, CI_REF, CI_GIT_AUTH,
+# CI_OWN, CI_LOG_GROUPS, MKOSI_*, DEBIAN_IMAGE, PATH (exported); files under CI_TMP (agent.outcome, dist, cache) are shared.
+#
+# Environment (the CI maps its own variables onto these; nothing CI-specific below):
+#   CI_TMP        work directory outside the tree (required): agent dist, cache, logs, mkosi, output
+#   CI_SUMMARY    file the summary lines are appended to (default: $CI_TMP/summary.md)
+#   STAGE         gate | selfcheck | lock | cp | gpu | harness (the agent, image and harness steps read it)
+#   CI_TAG_GLOB   the tag the commit must carry, the build is "by tag" (default build-try-*; harness: harness-try-*)
+#   CI_REF        the branch being built: a ci/harness-try-* branch is always STAGE=harness (the stage of the harness gate
+#                 comes from the branch, so the commit built is the commit merged)
+#   CI_GIT_AUTH   optional git -c http.extraHeader value for fetching the history (oss step: old-hashes rule); without
+#                 it the remote's own credentials are used
+#   CI_OWN        owner/repository of the remote, for the own-names rule (default: from the origin URL)
+#   CI_LOG_GROUPS github: fold the whole build log in the job log (::group::); anything else: plain separators
+#   MKOSI_TAG, MKOSI_COMMIT, DEBIAN_IMAGE   pinned below; set only to test another pin
+# Exit codes: 75 Debian snapshot unavailable (the run did not take place - not a reproducibility or signature failure),
+# other non-zero = failure. mkosi runs as root through sudo with an explicit environment (never sudo -E); every other
+# step runs as the caller.
+set -uo pipefail
+TOP=$(cd "$(dirname "$0")/.." && pwd)
+SELF=$TOP/ci/$(basename "$0")
+T=${CI_TMP:?CI_TMP: a work directory outside the tree}
+mkdir -p "$T"
+SUM=${CI_SUMMARY:-$T/summary.md}
+CI_SUMMARY=$SUM; export CI_TMP CI_SUMMARY
+MKOSI_TAG=${MKOSI_TAG:-v26}
+MKOSI_COMMIT=${MKOSI_COMMIT:-84af20892b61c8e177e391f997ded8b4cb5514f2}
+# Debian 13 for the tools that need Debian's own versions (sqv of apt-pin.py); the same pinned digest as test.yml
+DEBIAN_IMAGE=${DEBIAN_IMAGE:-debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6}
+STAGE=${STAGE:-}
+case ${CI_REF:-} in
+  ci/harness-try-*) STAGE=harness; CI_TAG_GLOB=${CI_TAG_GLOB:-harness-try-*}; export CI_TAG_GLOB ;;
+  # the CI branch names before build-try / harness-try / offline-try: refused, never read as a stage
+  ci/o[0-9]*-*) echo "run-stage.sh: CI branch $CI_REF has an old name (ci/build-try-*, ci/harness-try-*, ci/offline-try-*)" >&2; exit 2 ;;
+esac
+# the stage name before harness: refused, never run as a stage of its own
+[ "$STAGE" = o3 ] || [ "${1:-}" = o3 ] && { echo "run-stage.sh: stage o3 has an old name (harness)" >&2; exit 2; }
+export MKOSI_TAG MKOSI_COMMIT DEBIAN_IMAGE STAGE
+# mkosi of the host step, for every later step (the build entries run it under sudo env PATH="$PATH")
+[ -d "$T/mkosi/bin" ] && PATH=$T/mkosi/bin:$PATH
+group_start() { if [ "${CI_LOG_GROUPS:-}" = github ]; then echo "::group::$*"; else echo "----- $*"; fi; }
+group_end() { if [ "${CI_LOG_GROUPS:-}" = github ]; then echo "::endgroup::"; else echo "----- end"; fi; }
+# pipe_rc [-a] <file> <command...>: <command> | tee [-a] <file>; the return code is the command's (else tee's), read here
+# from PIPESTATUS - never left to errexit/pipefail
+pipe_rc() {
+  local a=() f s
+  [ "$1" = -a ] && { a=(-a); shift; }
+  f=$1; shift
+  "$@" | tee "${a[@]}" "$f" && return 0
+  s=("${PIPESTATUS[@]}"); [ "${s[0]}" != 0 ] && return "${s[0]}"; return "${s[1]:-1}"
+}
+
+# nvidia_offline <hosts file> <tools exec...>: both NVIDIA hosts to 0.0.0.0 in the host's hosts file (through sudo) and in
+# /etc/hosts of the tools container, each write read back; then neither host may answer on the host. Every failure is a
+# NVIDIA OFFLINE FAIL line and rc 1 (image, STAGE=gpu)
+nvidia_offline() {
+  local hf=$1 h; shift
+  for h in developer.download.nvidia.com nvidia.github.io; do
+    echo "0.0.0.0 $h" | sudo tee -a "$hf" >/dev/null
+    grep -qx "0.0.0.0 $h" "$hf" || { echo "NVIDIA OFFLINE FAIL: $hf of the host has no line 0.0.0.0 $h" | tee -a "$SUM"; return 1; }
+    "$@" sh -c "echo '0.0.0.0 $h' >> /etc/hosts"
+    "$@" grep -qx "0.0.0.0 $h" /etc/hosts || { echo "NVIDIA OFFLINE FAIL: /etc/hosts of the tools container has no line 0.0.0.0 $h" | tee -a "$SUM"; return 1; }
+    if curl -s -o /dev/null -m 15 "https://$h/"; then echo "NVIDIA OFFLINE FAIL: $h still reachable" | tee -a "$SUM"; return 1; fi
+  done
+}
+
+# provenance_summary <apt-pin-inputs.json> <upstream.json>: provenance of the third-party inputs into the summary; a
+# failure to read them is a PROVENANCE FAIL line and rc 1 (image)
+provenance_summary() {
+  local r=0
+  pipe_rc -a "$SUM" python3 -I - "$1" "$2" <<'PY' || r=$?
+import json, sys
+a = json.load(open(sys.argv[1]))
+print("provenance (apt-pin-inputs.json; source only: %s):" % (", ".join(a.get("source_only", [])) or "none"))
+for p in a["sets"]:
+    roles = {}
+    for e in p["files"]:
+        roles[e["role"]] = roles.get(e["role"], 0) + 1
+    print("- [%s] %s key %s, InRelease sha256 %s (Date %s, Valid-Until %s), %s, files %s" % (p["set"], p.get("repository", ""),
+          p["key"]["fingerprint"], p["inrelease"]["sha256"][:16], p["inrelease"]["date"], p["inrelease"].get("valid_until") or "none", p["index"]["name"],
+          ", ".join("%s %d" % kv for kv in sorted(roles.items()))))
+u = json.load(open(sys.argv[2]))
+for c in u["components"]:
+    if not c.get("origin"):
+        print("- [release] %s %s sha256 %s %s" % (c["name"], c["version"], c["sha256"][:16], c.get("url", "")))
+PY
+  [ $r = 0 ] || { echo "PROVENANCE FAIL: rc=$r reading $1 $2" | tee -a "$SUM"; return 1; }
+}
+
+# the build is "by tag": the commit must carry a CI_TAG_GLOB tag
+step_tag() (
+set -eo pipefail
+cd "$TOP"
+glob=${CI_TAG_GLOB:-build-try-*}
+tag=$(git describe --exact-match --tags --match "$glob" HEAD 2>/dev/null) || {
+  echo "BUILD BY TAG: $(git rev-parse HEAD) has no $glob tag" | tee -a "$SUM"; exit 1; }
+echo "build by tag $tag = $(git rev-parse HEAD) ($(git log -1 --format=%s))" | tee -a "$SUM"
+)
+
+# publication rules without a word list (tests/compliance/oss-gate.py), before any build: the history without trees
+# (commit ids only) for the old-hashes rule; then the secrets scan of the tree (tests/compliance/gitleaks-gate.sh)
+step_oss() (
+set -eo pipefail
+cd "$TOP"
+a=(); [ -n "${CI_GIT_AUTH:-}" ] && a=(-c "http.extraHeader=$CI_GIT_AUTH")
+if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+  r=0; git "${a[@]}" fetch -q --unshallow --filter=tree:0 origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || r=$?
+  [ $r = 0 ] || { echo "OSS STEP FAIL: git fetch --unshallow rc=$r (the old-hashes rule needs the whole history)" | tee -a "$SUM"; exit 1; }
+fi
+own=${CI_OWN:-$(git remote get-url origin | sed -E 's#^.*github\.com[:/]##; s#^https?://[^/]+/##; s#\.git$##')}
+r=0; pipe_rc "$T/oss-gate.txt" python3 -I tests/compliance/oss-gate.py --selftest --history --own "$own" || r=$?
+{ echo '```'; cat "$T/oss-gate.txt"; echo '```'; } >> "$SUM"
+[ $r = 0 ] || { echo "OSS STEP FAIL: oss-gate.py rc=$r" | tee -a "$SUM"; exit 1; }
+r=0; pipe_rc "$T/gitleaks-gate.txt" sh tests/compliance/gitleaks-gate.sh || r=$?
+{ echo '```'; cat "$T/gitleaks-gate.txt"; echo '```'; } >> "$SUM"
+[ $r = 0 ] || { echo "OSS STEP FAIL: gitleaks-gate.sh rc=$r" | tee -a "$SUM"; exit 1; }
+)
+
+# the errexit invariant of this script (tests/ci/run-stage-errexit.sh, no build, seconds to a few minutes): a step body
+# fails on its first failing command whatever the caller, and every checked pipe of oss, host and image fails its step
+step_errexit() (
+set -eo pipefail
+cd "$TOP"
+r=0; pipe_rc "$T/errexit.txt" bash tests/ci/run-stage-errexit.sh || r=$?
+{ echo '```'; cat "$T/errexit.txt"; echo '```'; } >> "$SUM"
+[ $r = 0 ] || { echo "ERREXIT STEP FAIL: tests/ci/run-stage-errexit.sh rc=$r" | tee -a "$SUM"; exit 1; }
+)
+
+# host facts: kernel, user namespaces (never fails)
+step_preflight() (
+set -eo pipefail
+set -u
+r=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)
+c=$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || echo n/a)
+m=$(sysctl -n user.max_user_namespaces 2>/dev/null || echo n/a)
+if out=$(unshare --user --map-root-user true 2>&1); then u="ok"; else u="FAIL: $out"; fi
+echo "PREFLIGHT kernel $(uname -r); apparmor_restrict_unprivileged_userns=$r unprivileged_userns_clone=$c max_user_namespaces=$m; unshare --user --map-root-user (as $(id -un)): $u" | tee -a "$SUM"
+echo "mkosi as root; user namespaces not needed, not relaxed" | tee -a "$SUM"
+echo "pins (ci/run-stage.sh): mkosi $MKOSI_TAG $MKOSI_COMMIT; tools image $DEBIAN_IMAGE" | tee -a "$SUM"
+)
+
+# the agent on the pinned toolchain: install-tools, cargo test x3, build-release -> $T/dist
+step_agent() (
+set -eo pipefail
+set +e -uo pipefail   # no errexit here: the failures that decide this step are read explicitly below (rc, fail, exit)
+sudo apt-get update -q >/dev/null && sudo apt-get install -y -q --no-install-recommends musl-tools >/dev/null
+cd "$TOP/agent"
+rustup show active-toolchain || rustup toolchain install   # rust-toolchain.toml: 1.100.0 + musl target
+line="agent: rustc $(rustc --version | cut -d' ' -f2-)"
+fail=0
+# the agent's build tools: one absolute path on every build machine (docs/reproducible-build.md), named by
+# build-release.sh itself; made through sudo here, or once by root on a runner without sudo: then it must exist and be writable
+tb=$(dirname "$(./build-release.sh --print-tools-root)")
+if [ -d "$tb" ] && [ -w "$tb" ]; then :
+elif ! sudo -n install -d -o "$(id -u)" -g "$(id -g)" "$tb" 2>/dev/null; then
+  echo "agent: $tb missing or not writable, and no sudo -n to make it (create it once as root)"; fail=1
+fi
+[ $fail = 1 ] || ./build-release.sh --install-tools > "$T/agent-tools.log" 2>&1 || { fail=1; tail -n 30 "$T/agent-tools.log"; }
+line="$line; install-tools rc=$fail"
+tests='"" esp-bridge-tls lab-crash-points'; [ "${STAGE:-}" = harness ] && tests=   # harness: the dist only, its tests run in the build stages
+eval "set -- $tests"
+for f in "$@"; do
+  cargo test --release --locked --no-fail-fast ${f:+--features $f} > "$T/test_${f:-product}.log" 2>&1; rc=$?
+  p=$(grep -ho '[0-9]* passed' "$T/test_${f:-product}.log" | awk '{s+=$1} END{print s+0}')
+  q=$(grep -ho '[0-9]* failed' "$T/test_${f:-product}.log" | awk '{s+=$1} END{print s+0}')
+  line="$line; test ${f:-product} rc=$rc passed=$p failed=$q"
+  [ $rc = 0 ] || { fail=1; grep -E '^test .* FAILED|panicked|error(\[|:)' "$T/test_${f:-product}.log" | head -n 20; }
+done
+OUT=$T/dist ./build-release.sh > "$T/agent-release.log" 2>&1; rc=$?
+[ $rc = 0 ] || { fail=1; tail -n 30 "$T/agent-release.log"; }
+line="$line; build-release rc=$rc"
+[ -f "$T/dist/SHA256SUMS" ] && line="$line; $(tr '\n' ' ' < "$T/dist/SHA256SUMS")$(cat "$T/dist/FEATURES")"
+echo "AGENT $([ $fail = 0 ] && echo PASS || echo FAIL) $line" | tee -a "$SUM"
+exit $fail
+)
+
+# free the runner disk (SDKs the job never uses)
+step_disk() (
+set -eo pipefail
+set -uo pipefail
+# about 11G free before the build, 7G after the slot initrd and recovery (two tools trees of 1.5G);
+# the image adds a third tools tree and the build overlay. Removed: toolchains this job never uses (none of them is
+# a build input), docker images other than the tools image are pulled later
+before=$(df -h / | awk 'NR==2{print $4}')
+sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+  /usr/local/share/boost /usr/share/swift /usr/local/julia* /opt/az /usr/local/share/powershell /opt/microsoft
+docker image prune -a -f >/dev/null 2>&1 || true
+echo "runner disk: free on / $before -> $(df -h / | awk 'NR==2{print $4}')" | tee -a "$SUM"
+)
+
+# host packages and mkosi at its pinned commit -> $T/mkosi
+step_host() (
+set -eo pipefail
+set -euo pipefail
+r=0; sudo apt-get update -q >/dev/null || r=$?
+[ $r = 0 ] || { echo "HOST FAIL: apt-get update rc=$r" | tee -a "$SUM"; exit 1; }
+# erofs-utils: fsck.erofs for lab-gate and build-manifest.py (they read the /usr image after the build)
+r=0; sudo apt-get install -y -q --no-install-recommends uidmap debian-archive-keyring python3 git gnupg openssl erofs-utils >/dev/null || r=$?
+[ $r = 0 ] || { echo "HOST FAIL: apt-get install rc=$r" | tee -a "$SUM"; exit 1; }
+git clone -q --depth 1 --branch "$MKOSI_TAG" https://github.com/systemd/mkosi "$T/mkosi"
+got=$(git -C "$T/mkosi" rev-parse HEAD)
+[ "$got" = "$MKOSI_COMMIT" ] || { echo "mkosi $MKOSI_TAG is $got, pinned $MKOSI_COMMIT"; exit 1; }
+echo "mkosi $("$T/mkosi/bin/mkosi" --version) at $got" | tee -a "$SUM"
+)
+
+# the Debian snapshot reachable (75 if not)
+step_snapshot() (
+set -eo pipefail
+set -uo pipefail
+ts=$(sh "$TOP"/images/debian/tools/snapshot check) || exit 1
+ok=0
+for d in 0 15 30 60 120; do
+  sleep "$d"
+  for u in "debian/$ts/dists/trixie/InRelease" "debian/$ts/dists/trixie-updates/InRelease" \
+           "debian-security/$ts/dists/trixie-security/InRelease"; do
+    code=$(curl -s -o /dev/null -L --max-time 60 -w '%{http_code} %{url_effective}' "https://snapshot.debian.org/archive/$u") || code="000"
+    echo "$u -> $code"
+    case $code in 200\ *) ;; *) continue 2 ;; esac
+  done
+  ok=1; break
+done
+if [ $ok = 0 ]; then
+  echo "SNAPSHOT UNAVAILABLE: snapshot.debian.org $ts (run did not take place)" | tee -a "$SUM"; exit 75
+fi
+echo "Debian snapshot $ts reachable" | tee -a "$SUM"
+curl -s -o /dev/null -w 'resolved trixie InRelease: %{url_effective}\n' -L --max-time 60 \
+  "https://snapshot.debian.org/archive/debian/$ts/dists/trixie/InRelease" | tee -a "$SUM"
+)
+
+# facts about the third-party repository keys
+step_keyfacts() (
+set -eo pipefail
+set -uo pipefail
+k=$T/keys; mkdir -p "$k"; export GNUPGHOME=$k/gnupg; mkdir -m 700 "$GNUPGHOME"
+fact() { # fact <name> <url>
+  curl -fsSL --retry 3 --max-time 60 -o "$k/$1.asc" "$2" || { echo "$1: download failed ($2)"; return; }
+  echo "== $1 $2 sha256 $(sha256sum < "$k/$1.asc" | cut -c1-64)"
+  gpg --batch --show-keys --with-colons "$k/$1.asc" 2>/dev/null | awk -F: '$1=="pub"||$1=="sub"||$1=="fpr"||$1=="uid"{print "   " $1, $4, $5, $6, $10}'
+  # every signature packet: issuer, class (0x10-0x13 certification of a uid, 0x18 subkey binding, 0x19 primary
+  # key binding = back-signature inside a 0x18, 0x1f direct key), digest algo (2 = SHA1, 8 = SHA256,
+  # 10 = SHA512); self = issued by the key itself or its subkey (what apt-pin.py's anchor check reads)
+  own=$(gpg --batch --show-keys --with-colons "$k/$1.asc" 2>/dev/null | awk -F: '$1=="pub"||$1=="sub"{print $5}' | tr '\n' ' ')
+  gpg --batch --list-packets "$k/$1.asc" 2>/dev/null | awk -v own="$own" '
+    function name(d) { return d==2 ? "SHA1" : d==8 ? "SHA256" : d==9 ? "SHA384" : d==10 ? "SHA512" : d==11 ? "SHA224" : d==1 ? "MD5" : d==3 ? "RIPEMD160" : "algo" d }
+    function out() { if (k != "") printf "   sig issuer %s %s class %s digest %s (%s)\n", k, (index(" " own " ", " " k " ") ? "self" : "FOREIGN"), c, d, name(d); k = "" }
+    /^:signature packet:/ { out(); k = $0; sub(/.*keyid /, "", k); c = "?"; d = "?"; next }
+    /^:/ { out(); next }
+    k != "" && /sigclass/ { c = $0; sub(/.*sigclass /, "", c); sub(/[^0-9a-fx].*/, "", c) }
+    k != "" && /^[ \t]+digest algo/ { d = $0; sub(/.*digest algo /, "", d); sub(/[^0-9].*/, "", d) }
+    k != "" && /subpkt 32 .*signature:/ { b = $0; sub(/.*class /, "", b); e = b; sub(/,.*/, "", b); sub(/.*digest algo /, "", e); sub(/[^0-9].*/, "", e)
+      printf "   embedded back-signature class %s digest %s (%s) in the binding of %s\n", b, e, name(e), k }
+    END { out() }'
+}
+{ fact libnvidia-container https://nvidia.github.io/libnvidia-container/gpgkey
+  fact pkgs-k8s-v1.34 'https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key'; } | tee "$k/facts.txt"
+{ echo '```'; cat "$k/facts.txt"; echo '```'; } >> "$SUM"
+)
+
+# selfcheck: the slot initrd from the snapshot with the Debian tools tree
+step_initrd() (
+set -eo pipefail
+set +e -uo pipefail   # no errexit here: the failures that decide this step are read explicitly below (rc, fail, exit)
+cd "$TOP/images/debian/foilbird-initrd"
+# mkosi as root: only the build entry under sudo, environment listed explicitly
+sudo env PATH="$PATH" SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" ./build.sh > "$T/initrd.log" 2>&1; rc=$?
+tail -n 40 "$T/initrd.log"
+L=$T/initrd.log
+if [ $rc != 0 ] && grep -q -E '^(Err:[0-9]+ https://snapshot\.debian\.org|[EW]: Failed to fetch https://snapshot\.debian\.org|[EW]: .*snapshot\.debian\.org.*(Could not connect|Connection timed out|Could not resolve))' "$L"; then
+  echo "SNAPSHOT UNAVAILABLE during the initrd build (run did not take place)" | tee -a "$SUM"; exit 75
+fi
+{
+  echo "initrd build rc=$rc"
+  echo "apt Get/Hit from snapshot.debian.org: $(grep -c -E '^(Get|Hit):[0-9]+ https://snapshot\.debian\.org' "$L")"
+  echo "apt Get/Hit from any other host: $(grep -E '^(Get|Hit):[0-9]+ ' "$L" | grep -v -c 'https://snapshot\.debian\.org')"
+  echo "trixie-updates source used: $(grep -c -E 'snapshot\.debian\.org/archive/debian/[0-9T]+Z trixie-updates' "$L")"
+  echo "trixie-security source used: $(grep -c -E 'snapshot\.debian\.org/archive/debian-security/[0-9T]+Z trixie-security' "$L")"
+  echo "tools tree: $(grep -m1 -i -E 'tools tree|mkosi.tools' "$L" || echo '(no line)')"
+  [ -f out/initrd.cpio.zst ] && echo "initrd.cpio.zst sha256 $(sha256sum < out/initrd.cpio.zst | cut -c1-64) (SOURCE_DATE_EPOCH $(git log -1 --format=%ct))"
+} | tee -a "$SUM"
+exit $rc
+)
+
+# lock files from a first fetch (fails on purpose)
+step_lock() (
+set -eo pipefail
+set +e -uo pipefail   # no errexit here: the failures that decide this step are read explicitly below (rc, fail, exit)
+cd "$TOP"
+L=$T/lock.log; : > "$L"
+# apt-pin.py needs Debian 13's sqv (--cleartext; Ubuntu 24.04's sqv is too old): the tools
+# run in Debian 13 (pinned image digest, as test.yml), with sqv, gpg, dpkg and python3 from the build's own
+# Debian snapshot (reproducible.conf). Mounted: the tree (/src, the locks are written there), the cache, a work dir.
+ts=$(sh images/debian/tools/snapshot check) || exit 1
+mkdir -p "$T/apt-cache" "$T/work"
+docker run -d --name o2tools -v "$PWD:/src" -v "$T/apt-cache:/cache" -v "$T/work:/work" -w /src \
+  "$DEBIAN_IMAGE" sleep infinity >/dev/null || { echo "docker run $DEBIAN_IMAGE failed"; exit 1; }
+X="docker exec -w /src o2tools"; cache=/cache
+srcs="Types: deb\nURIs: http://snapshot.debian.org/archive/debian/$ts\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/$ts\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n"
+ok=0
+for d in 0 30 90; do
+  sleep $d
+  $X sh -c "rm -f /etc/apt/sources.list.d/*; printf '$srcs' > /etc/apt/sources.list.d/snapshot.sources
+    apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=3 update -q &&
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends sqv gpg gpg-agent gpgv dpkg python3 ca-certificates" > "$T/tools.log" 2>&1 && { ok=1; break; }
+  tail -n 5 "$T/tools.log"
+done
+if [ $ok = 0 ]; then
+  if grep -q -E '^(Err:[0-9]+ https?://snapshot\.debian\.org|[EW]: Failed to fetch https?://snapshot\.debian\.org|[EW]: .*snapshot\.debian\.org.*(Could not connect|Connection timed out|Could not resolve))' "$T/tools.log"; then echo "SNAPSHOT UNAVAILABLE while installing the tools (run did not take place)" | tee -a "$SUM"; exit 75; fi
+  echo "tools container: apt failed"; exit 1
+fi
+echo "tools: Debian 13 $DEBIAN_IMAGE, snapshot $ts; $($X sqv --version 2>&1 | head -n 1); $($X gpg --version | head -n 1); $($X python3 --version)" | tee -a "$SUM"
+base="--conf images/debian/apt-pin.conf"; prof="--conf profiles/k8s-worker/apt-pin.conf"
+fail=0
+# fetch downloads everything, then verifies against the lock: with an empty lock the ONLY acceptable refusal
+# is "not in the lock"; any other refusal (chain, key, SHA1 binding, network) is a finding and stops the stage
+step() { # step <label> <command...>
+  echo "== $1" | tee -a "$L"; shift
+  "$@" >> "$L" 2>&1; rc=$?; tail -n 5 "$L"; return $rc; }
+for c in "$base" "$prof"; do
+  if ! step "apt-pin fetch $c" $X python3 images/debian/tools/apt-pin.py fetch $c --cache "$cache"; then
+    tail -n 1 "$L" | grep -q 'REFUSED: .*lock .* refused: not in the lock' || { echo "FETCH REFUSED (not a lock refusal): $(tail -n 1 "$L")" | tee -a "$SUM"; fail=1; }
+  fi
+done
+if ! step "fetch-upstream fetch" $X python3 profiles/k8s-worker/tools/fetch-upstream.py fetch --cache "$cache"; then
+  tail -n 1 "$L" | grep -q 'REFUSED: .*lock .* refused: not in the lock' || { echo "UPSTREAM FETCH REFUSED (not a lock refusal): $(tail -n 1 "$L")" | tee -a "$SUM"; fail=1; }
+fi
+for c in "$base" "$prof"; do step "apt-pin lock $c" $X python3 images/debian/tools/apt-pin.py lock $c --cache "$cache" || fail=1; done
+step "fetch-upstream lock" $X python3 profiles/k8s-worker/tools/fetch-upstream.py lock --cache "$cache" || fail=1
+step "apt-pin verify (both set files, with the new locks)" $X python3 images/debian/tools/apt-pin.py verify $base $prof --cache "$cache" || fail=1
+step "fetch-upstream prepare (offline check against the new lock)" $X python3 profiles/k8s-worker/tools/fetch-upstream.py prepare --cache "$cache" --out /work/upstream || fail=1
+step "apt-pin-test (refusal probes, every set)" $X python3 images/debian/tools/apt-pin-test.py $base $prof --cache "$cache"; t=$?
+[ $t = 0 ] || fail=1
+# gate: the probes must have run. No "probes: N/M" line, M = 0 or N < M is a failure of the stage
+pl=$(grep -E '^probes: [0-9]+/[0-9]+ ' "$L" | tail -n 1)
+case $pl in
+  "probes: "*) n=${pl#probes: }; m=${n#*/}; m=${m%% *}; n=${n%%/*}
+     if [ "$m" -eq 0 ] || [ "$n" -ne "$m" ]; then echo "PROBES FAIL: $pl" | tee -a "$SUM"; fail=1; fi ;;
+  *) echo "PROBES FAIL: no probe ran (no 'probes: N/M' line; apt-pin-test rc=$t)" | tee -a "$SUM"; fail=1 ;;
+esac
+{
+  echo "probes: $(grep -E '^probes:' "$L" || echo none)"
+  grep -E '^[a-z0-9-]+ (P0|N[0-9]).* FAIL ' "$L" | head -n 20
+  echo '```'; for f in images/debian/apt-pin.lock profiles/k8s-worker/apt-pin.lock; do echo "### $f"; cat "$f"; done; echo '```'
+  echo "lock sha256: $(sha256sum images/debian/apt-pin.lock profiles/k8s-worker/apt-pin.lock | cut -c1-64 | tr '\n' ' ')"
+  for f in images/debian/apt-pin.lock profiles/k8s-worker/apt-pin.lock; do
+    echo "lock lines $f: apt $(grep -c '^apt ' "$f"), release $(grep -c '^release ' "$f")"; done
+} | tee -a "$SUM"
+{ echo '<details><summary>lock stage log (tail)</summary>'; echo; echo '```'; tail -n 150 "$L"; echo '```'; echo '</details>'; } >> "$SUM"
+if [ $fail = 0 ]; then echo "LOCK STAGE: locks written, verify and probes PASS; failing on purpose (review + commit the locks)" | tee -a "$SUM"
+else echo "LOCK STAGE FAIL: see the lines above" | tee -a "$SUM"; fi
+exit 1
+)
+
+# the image (cp|gpu) by build-all.sh from the committed locks, TEST keys; gates, manifest, summary
+step_image() (
+set -eo pipefail
+set +e -uo pipefail   # no errexit here: the failures that decide this step are read explicitly below (rc, fail, exit)
+cd "$TOP"
+echo "NVIDIA components built inside the job, not published" | tee -a "$SUM"
+rm -rf agent/target   # the dist is in $T/dist; disk for the build
+ts=$(sh images/debian/tools/snapshot check) || exit 1
+cache=$T/apt-cache; out=$T/out; L=$T/cp.log; : > "$L"
+mkdir -p "$cache"
+# tools that need Debian 13's sqv (apt-pin.py, fetch-upstream.py) run in Debian 13 (pinned digest, packages from
+# the build's own snapshot), as in the lock stage; the tree and the cache are mounted at THE SAME paths, so
+# build-all.sh passes host paths through TOOLS_EXEC unchanged
+docker run -d --name o2tools -v "$PWD:$PWD" -v "$cache:$cache" -w "$PWD" "$DEBIAN_IMAGE" sleep infinity >/dev/null ||
+  { echo "docker run $DEBIAN_IMAGE failed"; exit 1; }
+X="docker exec -w $PWD o2tools"
+srcs="Types: deb\nURIs: http://snapshot.debian.org/archive/debian/$ts\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/$ts\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n"
+ok=0
+for d in 0 30 90; do
+  sleep $d
+  $X sh -c "rm -f /etc/apt/sources.list.d/*; printf '$srcs' > /etc/apt/sources.list.d/snapshot.sources
+    apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=3 update -q &&
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends sqv gpg gpg-agent gpgv dpkg python3 ca-certificates" > "$T/tools.log" 2>&1 && { ok=1; break; }
+  tail -n 5 "$T/tools.log"
+done
+if [ $ok = 0 ]; then
+  if grep -q -E '^(Err:[0-9]+ https?://snapshot\.debian\.org|[EW]: Failed to fetch https?://snapshot\.debian\.org|[EW]: .*snapshot\.debian\.org.*(Could not connect|Connection timed out|Could not resolve))' "$T/tools.log"; then echo "SNAPSHOT UNAVAILABLE while installing the tools (run did not take place)" | tee -a "$SUM"; exit 75; fi
+  echo "tools container: apt failed"; exit 1
+fi
+echo "tools: Debian 13 $DEBIAN_IMAGE, snapshot $ts; $($X sqv --version 2>&1 | head -n 1); $($X python3 --version)" | tee -a "$SUM"
+# the cache from the network, checked against the COMMITTED locks: any refusal stops the stage
+base="--conf images/debian/apt-pin.conf"; prof="--conf profiles/k8s-worker/apt-pin.conf"
+for c in "$base" "$prof"; do
+  $X python3 images/debian/tools/apt-pin.py fetch $c --cache "$cache" >> "$L" 2>&1 ||
+    { echo "FETCH REFUSED $c: $(tail -n 1 "$L")" | tee -a "$SUM"; exit 1; }
+done
+$X python3 profiles/k8s-worker/tools/fetch-upstream.py fetch --cache "$cache" >> "$L" 2>&1 ||
+  { echo "UPSTREAM FETCH REFUSED: $(tail -n 1 "$L")" | tee -a "$SUM"; exit 1; }
+echo "cache: apt-pin fetch + verify ok (both set files), fetch-upstream fetch ok, against the committed locks $(sha256sum images/debian/apt-pin.lock profiles/k8s-worker/apt-pin.lock | cut -c1-16 | tr '\n' ' ')" | tee -a "$SUM"
+if [ "$STAGE" = gpu ]; then
+  # offline NVIDIA: from here on neither NVIDIA host is reachable, on the host (mkosi) nor in
+  # the tools container; everything below must come from the verified cache
+  nvidia_offline /etc/hosts $X || exit 1
+  echo "NVIDIA offline: developer.download.nvidia.com, nvidia.github.io -> 0.0.0.0 (host + tools container), unreachable" | tee -a "$SUM"
+  for c in "$base" "$prof"; do
+    $X python3 images/debian/tools/apt-pin.py fetch $c --cache "$cache" >> "$L" 2>&1 ||
+      { echo "OFFLINE FETCH FAIL $c (the cache does not carry the set): $(tail -n 1 "$L")" | tee -a "$SUM"; exit 1; }
+  done
+  echo "offline: apt-pin fetch + verify of every set from the cache alone: ok" | tee -a "$SUM"
+  # refusal probes against the cache, NVIDIA offline (the same gate as the lock stage)
+  P=$T/probes.log
+  $X python3 images/debian/tools/apt-pin-test.py $base $prof --cache "$cache" > "$P" 2>&1; t=$?
+  pl=$(grep -E '^probes: [0-9]+/[0-9]+ ' "$P" | tail -n 1)
+  pf=0
+  case $pl in
+    "probes: "*) n=${pl#probes: }; m=${n#*/}; m=${m%% *}; n=${n%%/*}; { [ "$m" -gt 0 ] && [ "$n" -eq "$m" ] && [ $t = 0 ]; } || pf=1 ;;
+    *) pf=1 ;;
+  esac
+  echo "refusal probes (NVIDIA offline): ${pl:-no probes line} rc=$t $([ $pf = 0 ] && echo PASS || echo FAIL)" | tee -a "$SUM"
+  { echo '<details><summary>probe lines</summary>'; echo; echo '```'; grep -E '^[a-z0-9-]+ (P0|N[0-9])' "$P"; echo '```'; echo '</details>'; } >> "$SUM"
+  [ $pf = 0 ] || { tail -n 30 "$P"; echo "PROBES FAIL" | tee -a "$SUM"; exit 1; }
+fi
+# ephemeral TEST keys on tmpfs, never leave the job
+keys=/dev/shm/ci-test-keys
+tests/lib/keys.sh gen "$keys" > "$T/keys.txt" && tests/lib/keys.sh check "$keys" || { echo "TEST keys: keys.sh failed"; exit 1; }
+{ echo "TEST keys (ephemeral, tmpfs, this job only):"; echo '```'; cat "$T/keys.txt"; echo '```'; } >> "$SUM"
+df -h / "$T" | tail -n +2
+# the build: build-all.sh runs as the runner user; mkosi entries under sudo env (mkosi as root)
+# harness: release 1 of the harness = variant cp with the harness epoch table (tests/README.md)
+variant=$STAGE; hx=(); [ "$STAGE" = harness ] && { variant=cp; hx=(--release-epochs 1:1,2:4); }
+TOOLS_EXEC="$X" SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" images/debian/tools/build-all.sh \
+  --profile profiles/k8s-worker --variant "$variant" --version 1 --epoch 1 --min-version 1 "${hx[@]}" \
+  --keys "$keys" --agent-dist "$T/dist" --cache "$cache" --output-dir "$out" > "$T/build.log" 2>&1; rc=$?
+df -h / | tail -n +2
+tail -n 60 "$T/build.log"
+B=$T/build.log
+M=$out/build-manifest.txt
+# gate: apt may read only the Debian snapshot and the verified local copies (file:/srv/apt-pin). Any other source
+# (such as a tools tree from the live http://deb.debian.org) fails the stage. Per build-all step.
+awk '/^== build-all: /{st=$0; sub(/^== build-all: /, "", st); if (!(st in seen)) {seen[st]=1; order[++n]=st}}
+     /^(Get|Hit):[0-9]+ [a-z]+:/{ if ($2 ~ /^https:\/\/snapshot\.debian\.org\//) sn[st]++; else if ($2 ~ /^file:/) fl[st]++; else lv[st]++ }
+     END{for (i=1; i<=n; i++) {k=order[i]; if (sn[k]+fl[k]+lv[k] == 0) continue; printf "apt sources [%s]: snapshot %d, file %d, live %d\n", k, sn[k], fl[k], lv[k]; t+=lv[k]}; printf "LIVE %d\n", t}' "$B" > "$T/sources.txt"
+live=$(sed -n 's/^LIVE //p' "$T/sources.txt")
+{
+  grep -v '^LIVE ' "$T/sources.txt"
+  if [ "${live:-0}" != 0 ]; then
+    echo "LIVE MIRROR FAIL: $live apt lines from a source other than the snapshot and file:/srv/apt-pin:"
+    grep -E '^(Get|Hit):[0-9]+ [a-z]+:' "$B" | grep -v -E '^(Get|Hit):[0-9]+ (https://snapshot\.debian\.org/|file:)' | head -n 5 | sed 's/^/  live: /'
+  else echo "live mirror: 0 apt lines outside the snapshot and file:/srv/apt-pin"; fi
+} | tee -a "$SUM"
+[ "${live:-0}" = 0 ] || [ $rc != 0 ] || rc=1
+{
+  echo "build-all.sh rc=$rc (profile k8s-worker, variant $STAGE, version 1, SOURCE_DATE_EPOCH $(git log -1 --format=%ct))"
+  grep -E '^== build-all:|^build-all: |REFUSED|ERROR' "$B" | head -n 30
+  echo "apt Get/Hit from snapshot.debian.org: $(grep -c -E '^(Get|Hit):[0-9]+ https://snapshot\.debian\.org' "$B")"
+  echo "apt Get/Hit from any other host: $(grep -E '^(Get|Hit):[0-9]+ (https?|ftp)://' "$B" | grep -v -c 'https://snapshot\.debian\.org')"
+  # by source (scheme://host/first path part): what "other" is, by name
+  echo "apt Get/Hit by source: $(grep -o -E '^(Get|Hit):[0-9]+ [a-z]+:/*[^/ ]*/[^/ ]*' "$B" | cut -d' ' -f2 | sort | uniq -c | awk '{printf "%s %s; ", $2, $1}')"
+  grep -E '^(Get|Hit):[0-9]+ (https?|ftp)://' "$B" | grep -v 'https://snapshot\.debian\.org' | head -n 5 | sed 's/^/  other: /'
+  echo "trixie-updates source used: $(grep -c -E 'snapshot\.debian\.org/archive/debian/[0-9T]+Z trixie-updates' "$B")"
+  # the aptpin sandbox tree is what apt reads (file:/srv/apt-pin/<set>/)
+  echo "apt-pin sandbox source used (file:/srv/apt-pin): $(grep -c 'file:/srv/apt-pin' "$B"), sets: $(grep -o 'file:/srv/apt-pin/[a-z0-9-]*' "$B" | sort -u | tr '\n' ' ')"
+  [ -f "$out/build-params.txt" ] && { echo '```'; cat "$out/build-params.txt"; echo '```'; }
+  [ -f "$out/lab-gate.txt" ] && echo "lab-gate: $(tail -n 1 "$out/lab-gate.txt")"
+} | tee -a "$SUM"
+if [ -f "$M" ]; then
+  S=$T/manifest-summary.md
+  {
+    echo "build manifest: $(grep -vc '^#' "$M") lines, sha256 $(sha256sum < "$M" | cut -c1-64)"
+    echo "stable part (without keyed lines): sha256 $(grep -v -e '^#' -e '^keyed ' "$M" | sha256sum | cut -c1-64)"
+    echo "lines per class: $(grep -v '^#' "$M" | cut -d' ' -f1,2 | sort | uniq -c | awk '{printf "%s/%s=%s ", $2, $3, $1}')"
+    echo "keyed classes, sha256 of each class's lines (differ by construction between key sets): $(for c in $(grep '^keyed ' "$M" | cut -d' ' -f2 | sort -u); do printf '%s=%s ' "$c" "$(grep "^keyed $c " "$M" | sha256sum | cut -c1-12)"; done)"
+    echo "CI <-> CI: build-manifest.py extract <raw job log> --output A, the same for the second run, build-manifest.py compare A B (exit 0 = stable part equal)"
+    echo "NVIDIA kernel modules in /usr: $(grep -c -E '^usr ko .*/nvidia[^/]*\.ko' "$M"); NVIDIA packages installed: $(grep -E '^package deb ' "$M" | awk '$NF ~ /nvidia/ {printf "%s=%s ", $NF, $3}')"
+    echo '<details><summary>manifest: input, package, keyed (usr lines in the job log)</summary>'; echo; echo '```'
+    grep -E '^(input|package|keyed) ' "$M"; echo '```'; echo '</details>'
+  } > "$S"
+  cat "$S" >> "$SUM"; head -n 4 "$S"
+  echo "=== BEGIN build-manifest.txt"; cat "$M"; echo "=== END build-manifest.txt"
+  provenance_summary images/debian/mkosi/apt-pin-inputs.json profiles/k8s-worker/upstream/upstream.json || exit 1
+else
+  echo "build manifest: none (build-all.sh rc=$rc)" | tee -a "$SUM"
+fi
+{ echo '<details><summary>build log (tail)</summary>'; echo; echo '```'; tail -n 150 "$B"; echo '```'; echo '</details>'; } >> "$SUM"
+group_start "build log (whole)"; cat "$B"; group_end
+# exit 75 only for apt's own fetch errors against the snapshot (Err:/E:/W: lines), never for a Get: line whose
+# version or size happens to hold 502 or 429
+if [ $rc != 0 ] && grep -q -E '^(Err:[0-9]+ https://snapshot\.debian\.org|[EW]: Failed to fetch https://snapshot\.debian\.org|[EW]: .*snapshot\.debian\.org.*(Could not connect|Connection timed out|Could not resolve))' "$B"; then
+  grep -m 3 -E '^(Err:|[EW]: ).*snapshot\.debian\.org' "$B" | sed 's/^/  snapshot: /' | tee -a "$SUM"
+  echo "SNAPSHOT UNAVAILABLE during the build (run did not take place)" | tee -a "$SUM"; exit 75
+fi
+if [ "$STAGE" = harness ]; then echo "HARNESS RELEASE 1 $([ $rc = 0 ] && echo PASS || echo FAIL) (the gate is HARNESS GATE below)" | tee -a "$SUM"
+else echo "${STAGE^^} STAGE $([ $rc = 0 ] && echo PASS || echo FAIL)" | tee -a "$SUM"; fi
+exit $rc
+)
+
+# harness: releases 2 3 4 of the harness from the same tree and keys (build-all.sh --image-only: the slot initrd and recovery
+# UKI of release 1), then the channel of 2 3 4 checked offline (tests/ci/release-channel.sh); nothing leaves the job
+step_harness_rel() (
+set +e -uo pipefail
+sudo apt-get install -y -q --no-install-recommends fdisk xz-utils binutils >/dev/null   # sfdisk, xz, objcopy
+cd "$TOP"
+keys=/dev/shm/ci-test-keys; cache=$T/apt-cache; R=$T/rel; mkdir -p "$R"; ln -sfn "$T/out" "$R/1"
+X="docker exec -w $PWD o2tools"; rc=0
+for v in 2 3 4; do
+  case $v in 2|3) e=1; m=1; p=pcr-e1 ;; 4) e=2; m=4; p=pcr-e2 ;; esac
+  x=(); [ $v = 3 ] && x=(--extra-tree tests/overlays/t7-broken-foil-config)
+  t0=$(date +%s)
+  TOOLS_EXEC="$X" SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" images/debian/tools/build-all.sh \
+    --profile profiles/k8s-worker --variant cp --version $v --epoch $e --min-version $m --release-epochs 1:1,2:4 \
+    --pcr $p "${x[@]}" --image-only --keys "$keys" --agent-dist "$T/dist" --cache "$cache" \
+    --output-dir "$R/$v" > "$T/build_$v.log" 2>&1; b=$?
+  echo "release $v: build-all.sh rc=$b $(( $(date +%s) - t0 ))s epoch=$e min=$m $p${x:+ T7 overlay} $(grep -E '^== build-all: slot initrd and recovery' "$T/build_$v.log" | cut -c15-) lab-gate: $(tail -n 1 "$R/$v/lab-gate.txt" 2>/dev/null)" | tee -a "$SUM"
+  if [ $b != 0 ]; then
+    tail -n 40 "$T/build_$v.log"
+    if grep -q -E '^(Err:[0-9]+ https://snapshot\.debian\.org|[EW]: Failed to fetch https://snapshot\.debian\.org|[EW]: .*snapshot\.debian\.org.*(Could not connect|Connection timed out|Could not resolve))' "$T/build_$v.log"; then
+      echo "SNAPSHOT UNAVAILABLE during release $v (run did not take place)" | tee -a "$SUM"; exit 75
+    fi
+    rc=1; break
+  fi
+done
+df -h / | tail -n +2
+if [ $rc = 0 ]; then
+  tests/ci/release-channel.sh --out "$R" --keys "$keys" --agent-dist "$T/dist" --channel "$T/channel" > "$T/channel.log" 2>&1 || rc=1
+  { echo '```'; cat "$T/channel.log"; echo '```'; } | tee -a "$SUM"
+fi
+echo "HARNESS RELEASES $([ $rc = 0 ] && echo PASS || echo FAIL)" | tee -a "$SUM"
+exit $rc
+)
+
+# harness: make test-container STRICT=1 over every scenario against release 1, the channel of 2 3 4 and the job's keys. Guests
+# sized for a 2 vCPU / 7 GiB runner (one guest at a time). What a failed step needs is printed (the job keeps no files).
+step_harness_test() (
+set -uo pipefail
+[ -e /dev/kvm ] || { echo "no /dev/kvm on this runner"; exit 1; }
+echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm-harness.rules >/dev/null
+sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+docker rm -f o2tools >/dev/null 2>&1 || true   # the build's tools container; memory for the guest
+mkdir -p "$T/work"; cd "$TOP"
+rc=0
+ENGINE=${ENGINE:-docker} VM_MEM=${VM_MEM:-3G} VM_SMP=${VM_SMP:-2} API_TIMEOUT=${API_TIMEOUT:-600} SETTLE=${SETTLE:-60} \
+STRICT=1 ENROLL=${ENROLL:-auto} IMAGE="$T/out/foilbird-deb_1.raw" FOILCTL="$T/dist/foilctl" KEYS=/dev/shm/ci-test-keys \
+  CHANNEL="$T/channel" AGENT_SUMS="$T/dist/SHA256SUMS" WORK="$T/work" make test-container || rc=$?
+f=$T/work/results.txt
+{ echo '```'; cat "$f" 2>/dev/null || echo "no results.txt"; echo '```'; } >> "$SUM"
+cat "$f" 2>/dev/null || true
+for t in "$T"/work/logs/*/*.serial_tail.txt; do [ -f "$t" ] && { echo "--- $t"; cat "$t"; }; done
+if [ $rc != 0 ]; then
+  for t in "$T"/work/logs/*/stage_*.txt "$T"/work/logs/*/*.final.journal.txt "$T"/work/*.final.journal.txt; do
+    [ -f "$t" ] && { echo "--- $t"; tail -n 80 "$t" | cut -c1-300; }; done
+  [ -f "$T/work/channel/server.log" ] && { echo "--- channel server log (last 60 lines)"; tail -n 60 "$T/work/channel/server.log" | cut -c1-300; }
+fi
+v=FAIL; [ $rc = 0 ] && tail -n 1 "$f" | grep -q '^HARNESS PASS ' && tail -n 1 "$f" | grep -q ' 0 skipped' && v=PASS
+echo "HARNESS GATE $v (make test-container rc=$rc, $(tail -n 1 "$f" 2>/dev/null))" | tee -a "$SUM"
+[ $v = PASS ]
+)
+
+# the agent step's outcome decides the job (the image step does not run without it)
+step_result() (
+s=$(cat "$T/agent.outcome" 2>/dev/null || echo skipped)
+echo "agent step: $s" | tee -a "$SUM"
+[ "$s" = success ] || { echo "AGENT FAIL: fix it forward in agent/ before any other change to agent/"; exit 1; }
+)
+
+run_step() { # run_step <name>: the step in a process of its own (its set -e holds whatever the caller), the outcome
+  # recorded for the agent (read by result and by stage runs). Never `"step_$1" || rc=$?`: errexit would be off in the step
+  local rc=0
+  bash "$SELF" __step "$1" || rc=$?
+  [ "$1" = agent ] && { [ $rc = 0 ] && echo success || echo failure; } > "$T/agent.outcome"
+  return $rc
+}
+
+run_stage() { # run_stage <stage>: the steps of build.yml for that stage, in order; the agent may fail (the job then fails
+  # at result, after the other steps ran, as in build.yml); any other failing step stops the stage with its exit code
+  local s rc=0 order
+  case $1 in
+    gate)      order="preflight tag oss errexit" ;;
+    selfcheck) order="preflight tag oss errexit agent host snapshot keyfacts initrd result" ;;
+    lock)      order="preflight tag oss keyfacts lock" ;;
+    cp|gpu)    order="preflight tag oss agent disk host snapshot keyfacts image result" ;;
+    harness)   order="preflight tag oss agent disk host snapshot keyfacts image harness_rel harness_test result" ;;
+    *) echo "run-stage.sh: unknown stage $1 (gate|selfcheck|lock|cp|gpu|harness)" >&2; return 2 ;;
+  esac
+  STAGE=$1; export STAGE
+  [ "$1" = harness ] && { CI_TAG_GLOB=${CI_TAG_GLOB:-harness-try-*}; export CI_TAG_GLOB; }
+  for s in $order; do
+    echo "===== run-stage $1: $s"
+    case $s in image|harness_rel|harness_test) [ "$(cat "$T/agent.outcome" 2>/dev/null)" != success ] && { echo "$s: skipped (agent step failed)"; continue; } ;; esac
+    [ -d "$T/mkosi/bin" ] && case ":$PATH:" in *":$T/mkosi/bin:"*) ;; *) PATH=$T/mkosi/bin:$PATH ;; esac
+    if [ "$s" = agent ]; then run_step agent || true; continue; fi
+    run_step "$s" || { rc=$?; echo "===== run-stage $1: $s failed rc=$rc"; return $rc; }
+  done
+}
+
+case ${1:-} in
+  step) n=${2:?step name}; declare -F "step_$n" >/dev/null || { echo "run-stage.sh: unknown step $n" >&2; exit 2; }; run_step "$n" ;;
+  # the step process of run_step: the step function called here, at the top level of the script, never under || / if
+  __step) n=${2:?step name}; declare -F "step_$n" >/dev/null || { echo "run-stage.sh: unknown step $n" >&2; exit 2; }; "step_$n"; exit $? ;;
+  # tests/ci/run-stage-errexit.sh only: one checked helper of the image step on its own (no build)
+  __fn) case ${2:-} in nvidia_offline|provenance_summary) f=$2; shift 2; "$f" "$@"; exit $? ;; *) echo "run-stage.sh: __fn nvidia_offline|provenance_summary" >&2; exit 2 ;; esac ;;
+  gate|selfcheck|lock|cp|gpu|harness) run_stage "$1" ;;
+  *) awk 'NR > 1 && !/^#/ {exit} NR > 1' "$0"; exit 2 ;;
+esac

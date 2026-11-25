@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# CDI spec for the GPUs present at boot (containerd reads /var/run/cdi, a tmpfs: generated on every boot).
+# Skipped only on machines without an NVIDIA GPU (no driver bound: /proc/driver/nvidia/gpus empty or absent). With a GPU the
+# device nodes are created in ExecStartPre=, so a failure there fails the unit instead of skipping it. It used to be an
+# ExecCondition=: at boot udev (60-nvidia.rules), nvidia-persistenced's ExecCondition= and this unit ran nvidia-modprobe at
+# the same moment, the one that lost the race skipped its unit, and in a pre-release a GPU node booted without a CDI spec. Ordered
+# after nvidia-persistenced, whose ExecStartPre= loads nvidia.ko, so the driver is bound when the condition is checked.
+# Only in an image with the NVIDIA userspace (--variant gpu): profiles/k8s-worker/mkosi.finalize installs and enables it.
+[Unit]
+Description=Generate the NVIDIA CDI specification
+After=systemd-udev-trigger.service systemd-modules-load.service nvidia-persistenced.service
+Before=containerd.service kubelet.service
+ConditionDirectoryNotEmpty=/proc/driver/nvidia/gpus
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/bin/nvidia-modprobe -c 0 -u
+ExecStart=/usr/bin/nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml
+ExecStartPost=/usr/bin/nvidia-ctk cdi list
+StandardOutput=journal+console
+# a ceiling, not an estimate: not measured on hardware (a hang fails the unit and the health check instead of a Pending
+# forever)
+TimeoutStartSec=120s
+
+[Install]
+WantedBy=multi-user.target

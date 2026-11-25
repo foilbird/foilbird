@@ -1,0 +1,135 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Lab-code gate: a product build carries none of the lab-only code. Check only, never changes anything.
+#   lab-gate [--no-exec] [--dist DIR]... [--root DIR]... [--usr-image FILE]...
+#   --dist       an agent dist of agent/build-release.sh (foil-agent, FEATURES)
+#   --root       an image tree: $BUILDROOT, an unpacked /usr (fsck.erofs --extract=ROOT/usr ...) with or without the
+#                factory /etc copied to ROOT/etc, or a node's / mounted read-only
+#   --usr-image  the /usr partition image of a build (foilbird-deb_<V>.usr-x86-64.raw, EROFS): unpacked with fsck.erofs
+#                (erofs-utils) into a temporary directory, then checked as --root
+#   --no-exec    do not run "foil-agent version" (a foreign-architecture tree): the agent is then judged by its strings only
+# Lab-only code (never in a product build):
+#   lab-crash-points      agent feature: named points in the config save where the agent kills itself or hangs
+#   esp-bridge-tls        agent feature: TLS material and bridge configuration from the unauthenticated ESP
+#   FOILBIRD_VAR_EPOCH_LAB  foil-var-epoch compiled with crash points (mkosi.build FOILBIRD_VAR_EPOCH_CFLAGS)
+#   PoC boot checks       foil-poc-check (powers the machine off) and its inputs in /usr/lib/foil-poc-check (T9 test modules, one signed
+#                         with a foreign key, cuda-init): only lab builds carry them (images/debian/poc-checks,
+#                         FOILBIRD_POC_CHECKS=1). Lab: any of these files, a *.wants/ or *.requires/ entry, an "enable"
+#                         preset, or a dependency (Wants=, Requires=, ...) of another unit naming foil-poc-check
+#   lab-slow-esp          any drop-in of foil-install@ or foil-rollback@ (tests/overlays/lab-slow-esp: a 90 s pause,
+#                         the ESP idle-timeout proof); the product image has none
+# Every binary must be recognized (its usage string; for esp-bridge-tls exactly one of the lab string and the product
+# witness), so that a missing, renamed or foreign file is an error, not a silent pass. Not covered: a kernel command line
+# (systemd.wants=) in a UKI.
+# Output: one line per check, the last one "LAB-GATE lab=N checked=N result=PASS|FAIL".
+# Exit: 0 no lab code, 1 lab code found, 2 bad input (missing file, unreadable image, nothing to check).
+set -u
+lab=0; checked=0; exec_ok=1; tmp=
+die() { echo "lab-gate: $*" >&2; [ -z "$tmp" ] || rm -rf "$tmp"; exit 2; }
+hit() { echo "LAB  $*"; lab=$((lab + 1)); }
+ok() { echo "ok   $*"; }
+has() { grep -a -q -F -e "$2" "$1"; }   # has FILE STRING
+
+agent() {   # agent FILE [FEATURES-file]
+  b=$1; [ -f "$b" ] || die "$b: no such file (agent)"
+  checked=$((checked + 1))
+  has "$b" "foil-agent serve|apply-boot|boot-check" || die "$b: not a foil-agent binary (no usage string)"
+  # esp-bridge-tls: exactly one branch of tls_dir() is compiled in. The lab one keeps "... ImportCredential=agent.tls-*
+  # or <ESP dir>", the product one the refusal of TLS material on the ESP ("this build has no ESP fallback")
+  e=0; p=0; has "$b" "ImportCredential=agent.tls-* or " && e=1; has "$b" "this build has no ESP fallback" && p=1
+  case $e$p in
+    10) hit "$b: esp-bridge-tls (TLS from the ESP)" ;;
+    01) ok "$b: no esp-bridge-tls code" ;;
+    *) die "$b: esp-bridge-tls undecidable (lab string $e, product witness $p): not a foil-agent of this tree?" ;;
+  esac
+  # lab-crash-points: crash_point() is empty in a product build, its messages exist only with the feature
+  if has "$b" "lab crash point" || has "$b" "lab.crash"; then hit "$b: lab-crash-points (crash points in the config save)"
+  else ok "$b: no lab-crash-points code"; fi
+  if [ $exec_ok = 1 ]; then
+    v=$("$b" version 2>&1) || die "$b version: rc=$? ($v); --no-exec for a foreign tree"
+    case $v in
+      "foil-agent "*" features: -") ok "$b: $v" ;;
+      "foil-agent "*" features: "*) hit "$b: $v" ;;
+      *) die "$b version: unexpected output: $v" ;;
+    esac
+  fi
+  if [ -n "${2:-}" ]; then
+    [ -f "$2" ] || die "$2: no such file (dist FEATURES)"
+    f=$(cat "$2")
+    if [ "$f" = "features: -" ]; then ok "$2: $f"; else hit "$2: $f"; fi
+  fi
+}
+
+var_epoch() {   # var_epoch FILE
+  b=$1; [ -f "$b" ] || die "$b: no such file (foil-var-epoch)"
+  checked=$((checked + 1))
+  has "$b" "usage: foil-var-epoch" || die "$b: not a foil-var-epoch binary (no usage string)"
+  if has "$b" "/run/foilbird-lab/crash" || has "$b" "keyslot-without-token" || has "$b" "LAB: "; then
+    hit "$b: FOILBIRD_VAR_EPOCH_LAB (crash points in enroll/raise)"
+  else ok "$b: no FOILBIRD_VAR_EPOCH_LAB code"; fi
+}
+
+poc_check() {   # poc_check ROOT
+  r=$1; n=0; checked=$((checked + 1))
+  for f in usr/lib/foil-poc-check usr/libexec/foil-poc-check usr/lib/systemd/system/foil-poc-check.service etc/systemd/system/foil-poc-check.service; do
+    [ -e "$r/$f" ] || [ -L "$r/$f" ] || continue
+    hit "$r/$f: PoC boot check shipped"; n=$((n + 1)); done
+  for d in "$r/usr/lib/systemd" "$r/etc/systemd" "$r/usr/share/factory/etc/systemd" "$r/lib/systemd"; do
+    [ -d "$d" ] || continue
+    l=$(find "$d" \( -path '*.wants/foil-poc-check*' -o -path '*.requires/foil-poc-check*' -o -path '*.upholds/foil-poc-check*' \) 2>/dev/null)
+    p=$(find "$d" -path '*/system-preset/*.preset' -type f -exec grep -l -E '^[[:space:]]*enable[[:space:]]+foil-poc-check' {} + 2>/dev/null)
+    u=$(find "$d" -type f ! -name 'foil-poc-check.service' \( -name '*.service' -o -name '*.target' -o -name '*.timer' -o -name '*.path' \
+          -o -name '*.socket' -o -name '*.conf' \) -exec grep -l -E \
+          '^[[:space:]]*(Wants|Requires|Requisite|BindsTo|Upholds|OnSuccess|OnFailure)=.*foil-poc-check' {} + 2>/dev/null)
+    for f in $l; do hit "$f: foil-poc-check pulled in"; n=$((n + 1)); done
+    for f in $p; do hit "$f: foil-poc-check enabled by a preset"; n=$((n + 1)); done
+    for f in $u; do hit "$f: a unit pulls in foil-poc-check"; n=$((n + 1)); done
+  done
+  [ $n -gt 0 ] || ok "$r: no PoC boot check (foil-poc-check, /usr/lib/foil-poc-check)"
+}
+
+# drop-ins of the install and rollback units: the product image has none; a lab build may add one (tests/overlays/lab-slow-esp:
+# a pause longer than the ESP's idle timeout, the proof that an idle ESP does not cancel them)
+slowesp() {   # slowesp ROOT
+  r=$1; n=0; checked=$((checked + 1))
+  for d in "$r/usr/lib/systemd/system" "$r/etc/systemd/system" "$r/usr/share/factory/etc/systemd/system" "$r/lib/systemd/system"; do
+    for u in foil-install@ foil-rollback@; do
+      for f in "$d/$u"*.service.d/*; do   # the template and any instance (foil-install@3.service.d)
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        hit "$f: drop-in of $u.service (lab: tests/overlays/lab-slow-esp)"; n=$((n + 1))
+      done
+    done
+  done
+  [ $n -gt 0 ] || ok "$r: no drop-in of foil-install@/foil-rollback@"
+}
+
+root() {   # root DIR
+  r=${1%/}; [ -d "$r/usr" ] || die "$r has no usr/"
+  agent "$r/usr/bin/foil-agent"
+  var_epoch "$r/usr/libexec/foil-var-epoch"
+  poc_check "$r"
+  slowesp "$r"
+}
+
+[ $# -gt 0 ] || die "nothing to check (see the header of this script)"
+for a in "$@"; do [ "$a" = --no-exec ] && exec_ok=0; done
+while [ $# -gt 0 ]; do
+  case $1 in
+    --no-exec) shift ;;
+    --dist) d=${2:?--dist DIR}; [ -d "$d" ] || die "$d: no such directory"; agent "$d/foil-agent" "$d/FEATURES"; shift 2 ;;
+    --root) root "${2:?--root DIR}"; shift 2 ;;
+    --usr-image)
+      i=${2:?--usr-image FILE}; [ -f "$i" ] || die "$i: no such file"
+      command -v fsck.erofs >/dev/null || die "fsck.erofs (erofs-utils) is needed for --usr-image"
+      [ -n "$tmp" ] || { tmp=$(mktemp -d) || die "mktemp failed"; trap 'rm -rf "$tmp"' EXIT; }
+      rm -rf "$tmp/root"; mkdir -p "$tmp/root"
+      fsck.erofs --extract="$tmp/root/usr" "$i" >/dev/null 2>&1 || die "$i: fsck.erofs --extract failed"
+      [ -d "$tmp/root/usr/share/factory/etc" ] && cp -a "$tmp/root/usr/share/factory/etc" "$tmp/root/etc"
+      echo "--   $i unpacked"; root "$tmp/root"; shift 2 ;;
+    *) die "unknown argument $1 (see the header of this script)" ;;
+  esac
+done
+[ $checked -gt 0 ] || die "nothing checked"
+r=PASS; [ $lab -eq 0 ] || r=FAIL
+echo "LAB-GATE lab=$lab checked=$checked result=$r"
+[ $lab -eq 0 ]

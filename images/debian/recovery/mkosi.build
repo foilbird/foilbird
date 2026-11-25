@@ -1,0 +1,9 @@
+#!/bin/bash
+# Build overlay only: compile the diagnosis helper against the image's libc (inside the build overlay root, as
+# images/debian/mkosi/mkosi.build does), install it into the image.
+set -euo pipefail
+if [ -z "${NR_IN_CHROOT:-}" ]; then
+  exec mkosi-chroot env NR_IN_CHROOT=1 SRCDIR="$CHROOT_SRCDIR" DESTDIR="$CHROOT_DESTDIR" "$CHROOT_SCRIPT" "$@"
+fi
+mkdir -p "$DESTDIR/usr/libexec"
+gcc -O2 -Wall -Wextra -o "$DESTDIR/usr/libexec/foil-recovery-diag" "$SRCDIR/tools/foil-recovery-diag.c"

@@ -1,0 +1,4 @@
+#!/bin/bash
+# Shells, interpreters and scripts are removed (and checked) by ../tools/no-interpreters.finalize (FinalizeScripts=).
+set -euo pipefail
+echo "recovery: diag helper $(stat -c %s "$BUILDROOT/usr/libexec/foil-recovery-diag") bytes"

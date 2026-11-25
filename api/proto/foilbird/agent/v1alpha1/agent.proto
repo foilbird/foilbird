@@ -1,0 +1,781 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Node agent API, version 1 (PoC).
+//
+// Rules (see docs/decisions and api/README.md):
+//  * typed operations only: no RPC or field carries a command, script,
+//    argument vector or file system path (checked by api/tools/check_proto.py);
+//  * configuration is a versioned schema with strict validation and a
+//    generation number; no templates or expressions;
+//  * every RPC carries an access level option and the roles allowed to call it.
+//
+// Transport: gRPC over mutual TLS. The client certificate identifies the
+// caller; its roles (Subject OU, options.proto) are checked against the
+// RPC's (foilbird.agent.v1alpha1.roles) before any handler runs.
+syntax = "proto3";
+
+package foilbird.agent.v1alpha1;
+
+import "foilbird/agent/v1alpha1/options.proto";
+
+service NodeAgent {
+  // Identity, versions and boot state of the node.
+  rpc GetInfo(GetInfoRequest) returns (GetInfoResponse) {
+    option (foilbird.agent.v1alpha1.access) = ACCESS_LEVEL_READ;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_READER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_DIAG;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_UPDATER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONFIGURER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONTROLLER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_OPERATOR;
+  }
+  // Health checks (common + profile). Also the input of boot confirmation.
+  rpc GetHealth(GetHealthRequest) returns (GetHealthResponse) {
+    option (foilbird.agent.v1alpha1.access) = ACCESS_LEVEL_READ;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_READER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_DIAG;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_UPDATER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONFIGURER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONTROLLER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_OPERATOR;
+  }
+  // Currently applied configuration; secret fields are redacted.
+  rpc GetConfig(GetConfigRequest) returns (GetConfigResponse) {
+    option (foilbird.agent.v1alpha1.access) = ACCESS_LEVEL_READ;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_READER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_DIAG;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_UPDATER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONFIGURER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONTROLLER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_OPERATOR;
+  }
+  // Validate a configuration without applying it.
+  rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse) {
+    option (foilbird.agent.v1alpha1.access) = ACCESS_LEVEL_OPERATE;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONFIGURER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONTROLLER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_OPERATOR;
+  }
+  // Validate and apply a configuration as a new generation.
+  rpc ApplyConfig(ApplyConfigRequest) returns (ApplyConfigResponse) {
+    option (foilbird.agent.v1alpha1.access) = ACCESS_LEVEL_DESTRUCTIVE;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONFIGURER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONTROLLER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_OPERATOR;
+  }
+  // Download a release from the signed channel into staging, verify it
+  // (decision 0002) and install it into the inactive slot. Asynchronous:
+  // progress via GetUpdateStatus.
+  rpc StageUpdate(StageUpdateRequest) returns (StageUpdateResponse) {
+    option (foilbird.agent.v1alpha1.access) = ACCESS_LEVEL_OPERATE;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_UPDATER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONTROLLER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_OPERATOR;
+  }
+  // Slots, staging progress, boot counting and rollback information.
+  rpc GetUpdateStatus(GetUpdateStatusRequest) returns (GetUpdateStatusResponse) {
+    option (foilbird.agent.v1alpha1.access) = ACCESS_LEVEL_READ;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_READER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_DIAG;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_UPDATER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONFIGURER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONTROLLER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_OPERATOR;
+  }
+  // Units and their states (structured, no free text).
+  rpc ListUnits(ListUnitsRequest) returns (ListUnitsResponse) {
+    option (foilbird.agent.v1alpha1.access) = ACCESS_LEVEL_READ;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_READER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_DIAG;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_UPDATER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONFIGURER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONTROLLER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_OPERATOR;
+  }
+  // Journal entries, filtered, newest last, secrets redacted.
+  rpc ReadJournal(ReadJournalRequest) returns (ReadJournalResponse) {
+    option (foilbird.agent.v1alpha1.access) = ACCESS_LEVEL_DIAG;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_DIAG;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONTROLLER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_OPERATOR;
+  }
+  // Kernel log (dmesg) of a boot, from the journal, secrets redacted.
+  rpc ReadKernelLog(ReadKernelLogRequest) returns (ReadJournalResponse) {
+    option (foilbird.agent.v1alpha1.access) = ACCESS_LEVEL_DIAG;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_DIAG;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONTROLLER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_OPERATOR;
+  }
+  // Full diagnostic dump for an emergency (api/README.md, EMERGENCY):
+  // the journal of one boot, all units and the kernel, NOT redacted. Read
+  // only; operator role only, never published to MCP. Bounded in entries
+  // and bytes, truncation is reported. Every call is logged on the node
+  // (audit: caller certificate CN, entries and bytes returned).
+  rpc CollectDiagnostics(CollectDiagnosticsRequest) returns (CollectDiagnosticsResponse) {
+    option (foilbird.agent.v1alpha1.access) = ACCESS_LEVEL_EMERGENCY;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_OPERATOR;
+  }
+  // Raise the anti-rollback floor to the booted, committed release: the
+  // image's unit wipes the /var key slots of older PCR epochs and writes the
+  // floor. Irreversible (older releases no longer open /var), hence
+  // DESTRUCTIVE. Soak time and SECURITY are the controller's policy.
+  rpc RaiseMinVersion(RaiseMinVersionRequest) returns (RaiseMinVersionResponse) {
+    option (foilbird.agent.v1alpha1.access) = ACCESS_LEVEL_DESTRUCTIVE;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_OPERATOR;
+  }
+  // Reboot the node (into the staged slot if one is installed).
+  rpc Reboot(RebootRequest) returns (RebootResponse) {
+    option (foilbird.agent.v1alpha1.access) = ACCESS_LEVEL_DESTRUCTIVE;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_UPDATER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONTROLLER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_OPERATOR;
+  }
+  // Roll back a committed release (docs/boot-assessment.md): the image's unit takes the
+  // booted entry out of systemd-boot's choice and the node reboots into the
+  // previous release on the ESP. Refused (FAILED_PRECONDITION) unless
+  // expect_booted is the booted version, it is committed, no update is being
+  // staged and none is staged, no good entry newer than the booted one and the
+  // recovery UKI are on the ESP, the previous release's UKI and /usr are on the
+  // disk, it is not below the anti-rollback floor (BELOW_MIN_VERSION) and its
+  // /var epoch has a key slot (EPOCH_NOT_ENROLLED). After the reboot the
+  // rollback is reported with reason OPERATOR and the abandoned release
+  // cannot be staged again (STAGE_ERROR_ROLLED_BACK).
+  rpc Rollback(RollbackRequest) returns (RollbackResponse) {
+    option (foilbird.agent.v1alpha1.access) = ACCESS_LEVEL_DESTRUCTIVE;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_CONTROLLER;
+    option (foilbird.agent.v1alpha1.roles) = ROLE_OPERATOR;
+  }
+}
+
+// ---------------------------------------------------------------- common
+
+message Version {
+  // Image version as in os-release IMAGE_VERSION, e.g. "2026.11.15.1".
+  string image_version = 1;
+}
+
+// ---------------------------------------------------------------- GetInfo
+
+message GetInfoRequest {}
+
+enum AgentMode {
+  AGENT_MODE_UNSPECIFIED = 0;
+  // No node certificate yet; only registration is served (api/registration.md).
+  AGENT_MODE_REGISTRATION = 1;
+  // Node certificate issued; full API.
+  AGENT_MODE_OPERATIONAL = 2;
+  // Temporary configuration bridge (systemd credentials), TEST only.
+  AGENT_MODE_BRIDGE = 3;
+}
+
+enum Profile {
+  PROFILE_UNSPECIFIED = 0;
+  PROFILE_K8S = 1;
+  PROFILE_CONTAINER_HOST = 2;
+}
+
+message GetInfoResponse {
+  string hostname = 1;
+  string machine_id = 2;          // /etc/machine-id contents (32 hex chars)
+  string boot_id = 3;             // changes on every boot
+  Version booted = 4;
+  string os_id = 5;               // os-release ID, e.g. "foilbird"
+  string kernel_release = 6;      // uname -r
+  string agent_version = 7;
+  Profile profile = 8;
+  AgentMode mode = 9;
+  bool secure_boot = 10;          // UEFI SecureBoot variable
+  bool tpm_present = 11;
+  uint64 config_generation = 12;  // 0 = no configuration applied
+  int64 uptime_seconds = 13;
+  // How /var is protected at rest. The controller admits NONE only by
+  // allowlist; LUKS2_TPM2 -> NONE on the same node is an incident (an
+  // offline attacker can reformat the encrypted partition as plain ext4).
+  VarProtection var_protection = 14;
+  // API version the agent serves: its proto package, e.g. "foilbird.agent.v1alpha1".
+  // Every response also carries it in the header x-foilbird-api, errors included,
+  // so a client of another version can name both versions (an RPC path of
+  // another package is Unimplemented here, not a missing node).
+  string api = 15;
+}
+
+enum VarProtection {
+  VAR_PROTECTION_UNSPECIFIED = 0; // /var not mounted or not determinable
+  VAR_PROTECTION_NONE = 1;        // plain partition
+  // dm-crypt LUKS2; the image unlocks /var only with its TPM2 token
+  VAR_PROTECTION_LUKS2_TPM2 = 2;
+  VAR_PROTECTION_OTHER = 3;       // another device-mapper target
+}
+
+// ---------------------------------------------------------------- GetHealth
+
+message GetHealthRequest {}
+
+enum CheckStatus {
+  CHECK_STATUS_UNSPECIFIED = 0;
+  CHECK_STATUS_PASS = 1;
+  CHECK_STATUS_FAIL = 2;
+  CHECK_STATUS_PENDING = 3; // not yet decided (e.g. waiting for time sync)
+  CHECK_STATUS_SKIPPED = 4; // not applicable to this profile
+  // Degraded but not failing; never gates the boot. Example: clock not
+  // synchronized (mTLS and Kubernetes depend on it, so the controller
+  // must see it).
+  CHECK_STATUS_WARN = 5;
+}
+
+message HealthCheck {
+  // Stable identifier, e.g. "agent", "var-mounted", "network-online",
+  // "time-synced", "kubelet-ready", "gpu-modules", "gpu-count".
+  string name = 1;
+  CheckStatus status = 2;
+  string detail = 3; // human-readable, bounded length, no secrets
+}
+
+message GetHealthResponse {
+  // FAIL if any check fails, else PENDING if any pending, else WARN if any
+  // warns, else PASS.
+  CheckStatus overall = 1;
+  repeated HealthCheck checks = 2;
+  BootState boot = 3;
+}
+
+// Boot confirmation (decision 0003). The agent itself confirms the boot when
+// all required checks pass: it reaches boot-complete.target, which commits
+// the entry (<v>.efi, no counter). There is
+// deliberately no RPC to confirm a boot from outside the node.
+enum BootConfirmation {
+  BOOT_CONFIRMATION_UNSPECIFIED = 0;
+  BOOT_CONFIRMATION_PENDING = 1;   // checks still running
+  BOOT_CONFIRMATION_CONFIRMED = 2; // boot-complete reached, entry committed
+  BOOT_CONFIRMATION_FAILED = 3;    // checks failed; the node will reboot
+}
+
+message BootState {
+  BootConfirmation confirmation = 1;
+  // Boot entry of this boot (systemd-boot LoaderEntrySelected), e.g.
+  // "foilbird_2026.11.15.1+2-1.efi".
+  string entry = 2;
+  // Remaining boot attempts of the current entry; -1 if the entry has no
+  // counter (should not happen once 0003 is implemented).
+  int32 tries_left = 3;
+  // Set when this boot fell back to a previous version.
+  RollbackInfo rollback = 4;
+}
+
+// Set after Reboot into a staged release when another version came up.
+// Kept while the node runs `to`; cleared when it moves to another version.
+message RollbackInfo {
+  Version from = 1;   // version that failed to boot
+  Version to = 2;     // version booted instead
+  // Human-readable: what the ESP says and, if found in the journal of the
+  // failed boots, which gate checks failed (redacted, at most 1 KiB).
+  string reason = 3;
+  RollbackReason reason_code = 4;
+  uint32 attempts = 5;      // boots between the reboot and the fallback
+  int64 detected_unix = 6;  // when the agent noticed
+}
+
+enum RollbackReason {
+  ROLLBACK_REASON_UNSPECIFIED = 0;
+  // the entry of `from` is <id>_<from>+0-N.efi: every try failed the gate
+  ROLLBACK_REASON_BOOT_ATTEMPTS_EXHAUSTED = 1;
+  // the entry of `from` still has tries or is committed, but was not booted
+  ROLLBACK_REASON_NOT_SELECTED = 2;
+  // no entry of `from` on the ESP any more
+  ROLLBACK_REASON_ENTRY_REMOVED = 3;
+  // the Rollback RPC: an operator or controller abandoned `from`
+  ROLLBACK_REASON_OPERATOR = 4;
+}
+
+// ---------------------------------------------------------------- config
+
+// Node configuration. Field names match the temporary bridge credentials
+// (the bridge's credential format): node.hostname, node.network, k8s.join,
+// k8s.node-labels, k8s.node-taints. The agent renders them into
+// /run/foilbird/config/<name> in the same format as the bridge, so consumers
+// read one place regardless of the source.
+message NodeConfig {
+  // Schema version of this message; currently 1.
+  uint32 schema = 1;
+  // RFC 1123 host name, lower case, max 63 chars (no domain).
+  string hostname = 2;
+  NetworkConfig network = 3;
+  K8sConfig k8s = 4; // required for PROFILE_K8S, absent otherwise; see role
+  // Release channel override (mirror, air-gap). Absent = the channel built
+  // into the image. Only https; the release key is always the image's
+  // (decision 0012): a wrong server can deny updates or offer an old signed release,
+  // which the min_version floor refuses, but cannot inject a release.
+  // Changing it needs ApplyConfig (DESTRUCTIVE).
+  UpdateChannel update_channel = 5;
+  // Container registry hosts (mirrors, CAs) for containerd. The agent
+  // renders /run/foilbird/containerd/certs.d/<registry>/hosts.toml (+ CA files);
+  // the image's containerd config_path includes that directory. Registries
+  // not listed use containerd defaults. At most 32.
+  repeated RegistryHost registries = 6;
+  // Static name resolution (as Talos machine.network.extraHostEntries), for
+  // names the site DNS does not resolve to the right address, e.g. a
+  // registry behind an SNI gateway. The agent renders /run/foilbird/hosts (with
+  // the localhost lines); the image links /etc/hosts to it. At most 64.
+  repeated HostEntry extra_host_entries = 7;
+  // Time synchronization. Absent or empty servers = the image default
+  // (no NTP servers; only servers announced by DHCP).
+  TimeConfig time = 8;
+  // Role of the node in the Kubernetes cluster. Required exactly when k8s is
+  // set (a node without Kubernetes has no role: UNSPECIFIED); the role decides
+  // which k8s fields are allowed: WORKER the join fields, CONTROL_PLANE init
+  // and the cluster CA. Fixed for the life of an installation (alpha): an
+  // ApplyConfig that changes it, or drops k8s from a node with a role, is
+  // refused with FAILED_PRECONDITION ("needs a reinstall").
+  // A config persisted before this field existed (schema 1, k8s set, role
+  // UNSPECIFIED) is loaded with the role inferred the old way (init set =
+  // CONTROL_PLANE, otherwise WORKER); the file is not rewritten, GetConfig
+  // returns the inferred role, and the next ApplyConfig must carry it.
+  NodeRole role = 9;
+}
+
+enum NodeRole {
+  NODE_ROLE_UNSPECIFIED = 0; // no Kubernetes (k8s absent)
+  NODE_ROLE_WORKER = 1;      // kubeadm join (k8s join fields)
+  NODE_ROLE_CONTROL_PLANE = 2; // kubeadm init, control plane v0 (k8s.init + cluster CA)
+}
+
+// NTP servers for systemd-timesyncd. The agent renders
+// /run/systemd/timesyncd.conf.d/50-foil.conf (NTP=) and restarts timesyncd.
+// Before the first Kubernetes join the node waits for the clock to be
+// synchronized (join blocked, GetHealth time-synced FAIL after the wait);
+// afterwards an unsynchronized clock is only WARN and never gates a boot.
+message TimeConfig {
+  // IPv4, IPv6 or lower-case DNS name, no port; unique; at most 8.
+  repeated string servers = 1;
+}
+
+message HostEntry {
+  string ip = 1;                 // IPv4 or IPv6 address
+  repeated string hostnames = 2; // lower-case RFC 1123 names, 1..8
+}
+
+message RegistryHost {
+  // Registry as written in image references: "docker.io",
+  // "registry.k8s.io", "harbor.example.org", "host:port". Unique.
+  string registry = 1;
+  // Tried in order (pull and resolve only), at most 8. When set, the
+  // registry itself is never contacted: if every mirror fails, the pull
+  // fails (no silent fallback past the site's mirror).
+  repeated RegistryMirror mirrors = 2;
+  // PEM CA certificate(s) for the registry itself (a private registry
+  // without mirrors); empty = system trust. Not allowed with mirrors.
+  string ca_pem = 3;
+}
+
+// An https mirror. Typed parts as in UpdateChannel: always https.
+message RegistryMirror {
+  // "host[:port]".
+  string endpoint = 1;
+  // Empty: the standard API at https://<endpoint>/v2/. Otherwise the path
+  // that replaces /v2 (containerd override_path), e.g. a Harbor proxy-cache
+  // project: "/v2/dockerhub-proxy". [A-Za-z0-9._~/-], no "..".
+  string prefix = 2;
+  // PEM CA certificate(s) for the mirror; empty = system trust.
+  string ca_pem = 3;
+}
+
+// An https release server. Typed parts instead of a URL: the scheme is
+// always https, there is no user info, query or fragment.
+message UpdateChannel {
+  // "host[:port]" (DNS name, IPv4 or [IPv6]); port defaults to 443.
+  string endpoint = 1;
+  // Directory on the server holding SHA256SUMS and SHA256SUMS.gpg, e.g.
+  // "/foilbird/"; empty = "/". [A-Za-z0-9._~/-], no "..".
+  string prefix = 2;
+  // PEM CA certificate(s) trusted for this server (required, at most 16,
+  // no private keys). Only this CA is trusted for the channel.
+  string ca_pem = 3;
+}
+
+message NetworkConfig {
+  repeated Interface interfaces = 1;
+}
+
+message Interface {
+  // Which link this applies to. Exactly one must be set.
+  oneof match {
+    string mac_address = 1;    // "52:54:00:12:34:56"
+    string name = 2;           // kernel name, e.g. "enp1s0"
+  }
+  bool dhcp4 = 3;              // mutually exclusive with addresses
+  repeated string addresses = 4; // CIDR, e.g. "192.0.2.10/24", "fd00::10/64"
+  string gateway4 = 5;         // IPv4 address
+  string gateway6 = 6;         // IPv6 address
+  repeated string dns = 7;     // IP addresses
+  repeated string domains = 8; // search domains
+  uint32 mtu = 9;              // 0 = default; otherwise 576..9216
+}
+
+message K8sConfig {
+  // Worker (role WORKER): kubeadm JoinConfiguration, rendered by the agent from 1-3.
+  string api_server_endpoint = 1;     // "host:port"
+  SecretString bootstrap_token = 2;   // "abcdef.0123456789abcdef"
+  repeated string ca_cert_hashes = 3; // "sha256:<64 hex>"
+  map<string, string> node_labels = 4;
+  repeated Taint node_taints = 5;
+  // Control plane v0 (role CONTROL_PLANE; exclusive with 1-3):
+  // kubeadm InitConfiguration + ClusterConfiguration (kubeadm.k8s.io/v1beta4)
+  // as given by the operator, and the cluster CA the operator generated
+  // (kubeadm uses an existing CA, so the operator issues admin kubeconfigs and
+  // knows the CA hash and the bootstrap token in advance). Secrets are only
+  // returned as SHA-256. The first boot runs kubeadm init once.
+  SecretString init = 6;
+  string cluster_ca_crt = 7;          // PEM, one certificate
+  SecretString cluster_ca_key = 8;    // PEM private key
+  // Node IP the kubelet registers (worker: rendered as kubeletExtraArgs
+  // node-ip of the JoinConfiguration; a control plane sets it in init). Empty
+  // = kubelet's default (the address of the default-route interface). Needed
+  // when the cluster network is not the default-route one (Talos:
+  // kubelet.nodeIP.validSubnets).
+  string node_ip = 9;
+}
+
+message Taint {
+  string key = 1;
+  string value = 2;
+  TaintEffect effect = 3;
+}
+
+enum TaintEffect {
+  TAINT_EFFECT_UNSPECIFIED = 0;
+  TAINT_EFFECT_NO_SCHEDULE = 1;
+  TAINT_EFFECT_PREFER_NO_SCHEDULE = 2;
+  TAINT_EFFECT_NO_EXECUTE = 3;
+}
+
+// A secret value. Write-only: GetConfig returns it with `value` empty and
+// `sha256` set, so callers can compare without reading the secret.
+message SecretString {
+  string value = 1;
+  string sha256 = 2; // hex, output only
+}
+
+message ConfigError {
+  string field = 1;   // e.g. "network.interfaces[0].addresses[1]"
+  string message = 2;
+}
+
+message GetConfigRequest {}
+
+message GetConfigResponse {
+  uint64 generation = 1; // 0 = nothing applied
+  NodeConfig config = 2; // secrets redacted
+  ConfigSource source = 3;
+}
+
+enum ConfigSource {
+  CONFIG_SOURCE_UNSPECIFIED = 0;
+  CONFIG_SOURCE_NONE = 1;
+  CONFIG_SOURCE_BRIDGE = 2; // systemd credentials (temporary, TEST only)
+  CONFIG_SOURCE_API = 3;    // ApplyConfig
+}
+
+message ValidateConfigRequest {
+  NodeConfig config = 1;
+}
+
+message ValidateConfigResponse {
+  bool valid = 1;
+  repeated ConfigError errors = 2;
+}
+
+message ApplyConfigRequest {
+  NodeConfig config = 1;
+  // Optimistic concurrency: the request is rejected (FAILED_PRECONDITION)
+  // unless the current generation equals this value.
+  uint64 expected_generation = 2;
+}
+
+message ApplyConfigResponse {
+  uint64 generation = 1; // new generation
+  // The change takes effect only after a reboot: any change of the k8s
+  // section, including its first appearance on a node that is already up
+  // (kubeadm init/join and the kubelet flags run only at boot; the agent
+  // starts no units for it).
+  bool reboot_required = 2;
+}
+
+// ---------------------------------------------------------------- update
+
+message StageUpdateRequest {
+  // Target version from the signed release channel. The agent refuses
+  // versions below the anti-rollback minimum (T3) and releases not signed
+  // with the release key built into the image (T10).
+  Version target = 1;
+}
+
+message StageUpdateResponse {
+  // Identifier of the staging operation, reported in GetUpdateStatus.
+  string operation_id = 1;
+}
+
+message GetUpdateStatusRequest {}
+
+enum SlotState {
+  SLOT_STATE_UNSPECIFIED = 0;
+  SLOT_STATE_EMPTY = 1;
+  SLOT_STATE_BOOTED = 2;     // this boot
+  SLOT_STATE_COMMITTED = 3;  // known good, not booted now
+  SLOT_STATE_STAGED = 4;     // installed, not yet booted (has boot counter)
+  SLOT_STATE_BAD = 5;        // boot attempts exhausted
+}
+
+message Slot {
+  Version version = 1;
+  SlotState state = 2;
+  int32 tries_left = 3; // -1 = no counter
+}
+
+enum StagePhase {
+  STAGE_PHASE_UNSPECIFIED = 0;
+  STAGE_PHASE_IDLE = 1;
+  STAGE_PHASE_DOWNLOADING = 2; // into staging, not touching slots
+  STAGE_PHASE_VERIFYING = 3;   // signature, hashes, version policy
+  STAGE_PHASE_INSTALLING = 4;  // staging -> inactive slot
+  STAGE_PHASE_STAGED = 5;      // ready, reboot to activate
+  STAGE_PHASE_FAILED = 6;
+  // the image's unit adds the /var key slot for the target's PCR epoch
+  // (before the slot is written, so a failure leaves nothing bootable)
+  STAGE_PHASE_ENROLLING = 7;
+}
+
+enum StageError {
+  STAGE_ERROR_UNSPECIFIED = 0;
+  STAGE_ERROR_NONE = 1;
+  STAGE_ERROR_NOT_IN_CHANNEL = 2;
+  STAGE_ERROR_BAD_SIGNATURE = 3;    // T10
+  STAGE_ERROR_HASH_MISMATCH = 4;
+  STAGE_ERROR_BELOW_MIN_VERSION = 5; // T3
+  STAGE_ERROR_INCOMPLETE = 6;
+  STAGE_ERROR_NOT_COMMITTED = 7;   // previous update not yet committed (0002)
+  STAGE_ERROR_DOWNLOAD = 8;
+  STAGE_ERROR_INSTALL = 9;
+  // the version was rolled back on this node; a newer release is required
+  STAGE_ERROR_ROLLED_BACK = 10;
+  // the /var key slot for the target's epoch could not be added
+  STAGE_ERROR_ENROLL = 11;
+  // the target's PCR epoch has no /var key slot (var-epochs) and cannot get
+  // one (older than the booted epoch): it would not open /var
+  STAGE_ERROR_EPOCH_NOT_ENROLLED = 12;
+  // the target is older than the booted release: systemd-boot would boot the
+  // newer one anyway; going back is Rollback
+  STAGE_ERROR_OLDER_THAN_BOOTED = 13;
+}
+
+message StageStatus {
+  string operation_id = 1;
+  Version target = 2;
+  StagePhase phase = 3;
+  StageError error = 4;
+  string detail = 5;
+}
+
+message GetUpdateStatusResponse {
+  Version booted = 1;
+  repeated Slot slots = 2;
+  StageStatus stage = 3;
+  BootState boot = 4;
+  // Anti-rollback floor: max(/var/lib/foilbird/min_version written by the
+  // image's raise unit, FOILBIRD_MIN_VERSION of the booted image). In the PoC it
+  // is enforced by PCR key epochs of /var, not by a TPM NV counter.
+  Version min_version = 5;
+  // Release channel in effect for the next StageUpdate.
+  ChannelInfo channel = 6;
+  VarKeys var_keys = 7;
+  // The last operator operation that changes the node outside a stage (Rollback, RaiseMinVersion): it runs to its end
+  // even when the caller's connection is gone; a call of the same operation meanwhile waits for it and gets its result.
+  // Also set without a call in this process: the booted, committed release abandoned on the ESP but not rebooted
+  // (phase REBOOT_PENDING; Rollback again records it and reboots).
+  OperatorOperation operation = 8;
+}
+
+message OperatorOperation {
+  // "rollback" | "raise-min-version"
+  string kind = 1;
+  Version version = 2;
+  OperationPhase phase = 3;
+  string detail = 4;
+  int64 started_unix = 5;
+  int64 finished_unix = 6;  // 0 while running
+}
+
+enum OperationPhase {
+  OPERATION_PHASE_UNSPECIFIED = 0;
+  OPERATION_PHASE_RUNNING = 1;
+  // done; for a rollback the reboot was requested
+  OPERATION_PHASE_DONE = 2;
+  OPERATION_PHASE_FAILED = 3;
+  // rollback: the booted entry is abandoned on the ESP, the reboot did not happen (next boot starts the previous release)
+  OPERATION_PHASE_REBOOT_PENDING = 4;
+}
+
+// /var key slots per PCR epoch (image units foil-var-epoch@enroll-<v> and
+// @raise-<v>; the agent only starts them and reads their results).
+message VarKeys {
+  // mtime of /var/lib/foilbird/committed/<booted>; 0 = booted release not
+  // committed (RaiseMinVersion refuses).
+  int64 committed_at_unix = 1;
+  uint32 booted_epoch = 2;       // FOILBIRD_PCR_EPOCH of the booted image
+  // Epochs with a live key slot (/var/lib/foilbird/var-epochs); empty = /var
+  // not TPM-bound or unknown.
+  repeated uint32 enrolled = 3;
+  KeyOperation enroll = 4;       // last enroll since the agent started
+  KeyOperation raise = 5;        // last raise since the agent started
+}
+
+message KeyOperation {
+  Version version = 1;
+  KeyOpPhase phase = 2;
+  string detail = 3;   // from the unit's result file, bounded
+  int64 at_unix = 4;
+}
+
+enum KeyOpPhase {
+  KEY_OP_PHASE_UNSPECIFIED = 0;
+  KEY_OP_PHASE_IDLE = 1;
+  KEY_OP_PHASE_RUNNING = 2;
+  KEY_OP_PHASE_DONE = 3;
+  KEY_OP_PHASE_FAILED = 4;
+  KEY_OP_PHASE_SKIPPED = 5; // unit result noop (already done, or /var not TPM-bound)
+}
+
+enum ChannelOrigin {
+  CHANNEL_ORIGIN_UNSPECIFIED = 0;
+  CHANNEL_ORIGIN_NONE = 1;   // no channel in the image, no override
+  CHANNEL_ORIGIN_IMAGE = 2;  // /usr/lib/foil-agent/channel
+  CHANNEL_ORIGIN_CONFIG = 3; // NodeConfig.update_channel
+}
+
+message ChannelInfo {
+  ChannelOrigin origin = 1;
+  // Where releases are fetched from (directory or https base), for display.
+  string location = 2;
+  // Set when the configured channel cannot be used (StageUpdate fails).
+  string error = 3;
+}
+
+// ---------------------------------------------------------------- RaiseMinVersion
+
+message RaiseMinVersionRequest {
+  // The agent refuses (FAILED_PRECONDITION) unless this is the booted version.
+  Version expect_booted = 1;
+}
+
+message RaiseMinVersionResponse {
+  Version min_version = 1; // floor after the raise
+  KeyOperation raise = 2;
+}
+
+// ---------------------------------------------------------------- Reboot
+
+message RebootRequest {
+  // Free-text reason for the audit log; never interpreted.
+  string reason = 1;
+  // If set, the agent refuses (FAILED_PRECONDITION) unless this version is
+  // the staged one, so a controller cannot reboot into an unexpected slot.
+  Version expect_staged = 2;
+}
+
+message RebootResponse {
+  // Boot id of the boot being shut down; a new one appears in GetInfo.
+  string boot_id = 1;
+}
+
+// ---------------------------------------------------------------- Rollback
+
+message RollbackRequest {
+  // The agent refuses (FAILED_PRECONDITION) unless this is the booted version.
+  Version expect_booted = 1;
+  // Free-text reason for the audit log and RollbackInfo; never interpreted.
+  string reason = 2;
+}
+
+message RollbackResponse {
+  Version from = 1;  // the abandoned (booted) release
+  Version to = 2;    // the release the node reboots into
+  string boot_id = 3; // boot being shut down
+  // Non-empty when a check could not be made, e.g. the /var epoch of `to`
+  // (LUKS2 /var without var-epochs, encrypted before var-epoch).
+  string warning = 4;
+}
+
+// ---------------------------------------------------------------- diagnostics
+
+message ListUnitsRequest {
+  // Only units in the failed state.
+  bool failed_only = 1;
+}
+
+message UnitStatus {
+  string name = 1;         // e.g. "kubelet.service"
+  string description = 2;
+  string load_state = 3;   // loaded, not-found, masked, ...
+  string active_state = 4; // active, inactive, failed, activating, ...
+  string sub_state = 5;    // running, exited, dead, ...
+}
+
+message ListUnitsResponse {
+  repeated UnitStatus units = 1;
+}
+
+message ReadJournalRequest {
+  // Exact unit name ("kubelet.service"): its own messages and those of
+  // systemd about it. Empty = all units.
+  string unit = 1;
+  // Highest priority to include, 0 (emerg) .. 7 (debug); unset = all.
+  optional uint32 max_priority = 2;
+  // 0 = current boot, -1 = previous, ... (persistent journal).
+  int32 boot = 3;
+  // Unix seconds, 0 = unbounded.
+  int64 since_unix = 4;
+  int64 until_unix = 5;
+  // Last N entries; default 200, at most 2000.
+  uint32 limit = 6;
+}
+
+message ReadKernelLogRequest {
+  int32 boot = 1;                   // as in ReadJournalRequest
+  optional uint32 max_priority = 2;
+  uint32 limit = 3;                 // default 200, at most 2000
+}
+
+message CollectDiagnosticsRequest {
+  int32 boot = 1;        // 0 = current boot, -1 = previous, ...
+  // Last N entries; default 5000, at most 20000. The response is also cut
+  // to at most 3 MiB of messages (oldest entries dropped, truncated=true).
+  uint32 max_entries = 2;
+}
+
+message CollectDiagnosticsResponse {
+  repeated JournalEntry entries = 1; // NOT redacted; message at most 4 KiB
+  bool truncated = 2;                // entries or bytes limit reached
+  uint64 message_bytes = 3;          // sum of entry messages returned
+  repeated BootInfo boots = 4;
+}
+
+message JournalEntry {
+  int64 realtime_usec = 1;
+  uint32 priority = 2;
+  string unit = 3;       // _SYSTEMD_UNIT
+  string identifier = 4; // SYSLOG_IDENTIFIER or _COMM
+  uint32 pid = 5;
+  string message = 6;    // redacted, at most 4 KiB
+}
+
+message BootInfo {
+  int32 offset = 1;            // 0 = current, -1 = previous, ...
+  string boot_id = 2;
+  int64 first_realtime_usec = 3;
+}
+
+message ReadJournalResponse {
+  repeated JournalEntry entries = 1;
+  bool truncated = 2;      // more entries matched than the limit
+  uint32 redactions = 3;   // number of values replaced by [REDACTED]
+  repeated BootInfo boots = 4;
+}

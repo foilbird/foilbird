@@ -1,0 +1,16 @@
+# apt-pin.lock: pinned files of apt-pin.conf, one line each: <kind> <set> <sha256> <size> <url>
+# apt lines: written by images/debian/tools/apt-pin.py lock from the verified chain; review the diff
+apt k8s 7627818cf7bae52f9008c93e8b1f961f53dea11d40891778de216fb1b43be54d 1738 https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key
+apt k8s 90c1f4c9d602e904214fa4e6315b47687c7964a6bd1d2420e63b266233bba20c 16706572 https://pkgs.k8s.io/core:/stable:/v1.34/deb/amd64/cri-tools_1.34.0-1.1_amd64.deb
+apt k8s 585e17b79d974693f6fa165d2704eb0211d21e63267438296b78f1c1b97142b9 12545816 https://pkgs.k8s.io/core:/stable:/v1.34/deb/amd64/kubeadm_1.34.3-1.1_amd64.deb
+apt k8s 2b5afa9994bfdf3850b7801f2f95894dde28a6bc786a9618459d3b1956f1024b 12983684 https://pkgs.k8s.io/core:/stable:/v1.34/deb/amd64/kubelet_1.34.3-1.1_amd64.deb
+apt k8s 92aff22a4f49fa27a615353215a1602033de80ed908dd1f243270163e741b78a 39946992 https://pkgs.k8s.io/core:/stable:/v1.34/deb/amd64/kubernetes-cni_1.7.1-1.1_amd64.deb
+apt nvidia-container-toolkit c880576d6cf75a48e5027a871bac70fd0421ab07d2b55f30877b21f1c87959c9 3195 https://nvidia.github.io/libnvidia-container/gpgkey
+apt nvidia-container-toolkit a6bd7f3a94b0b53b9748872709e70e810473081de0e836a59405073012c49368 6002004 https://nvidia.github.io/libnvidia-container/stable/deb/amd64/nvidia-container-toolkit-base_1.20.2-1_amd64.deb
+release containerd 09a1b669ac6d21e7e24c3c33a9805b48987ba5845e8d88f039c47013a0c0025c 34821378 https://github.com/containerd/containerd/releases/download/v2.3.7/containerd-2.3.7-linux-amd64.tar.gz
+release containerd 0e85f304962a82818a103cd01d43dd459e037a41d3cf870b957cf6b5745288de 102 https://github.com/containerd/containerd/releases/download/v2.3.7/containerd-2.3.7-linux-amd64.tar.gz.sha256sum
+release containerd e12ce503171b3086e1ac148f8abc002fa33aa4a1b58e3cbb0d1273d42e84314a 7 https://raw.githubusercontent.com/containerd/containerd/v2.3.7/script/setup/runc-version
+release runc 599f6f94ff8c5057241eff0d54c3c74f95c34935b6457b33fe545defc61e9488 10866512 https://github.com/opencontainers/runc/releases/download/v1.5.2/runc.amd64
+release runc 2b36d2bfd696ce0fb90e0b7d218f74a258eb1294586abc1130d561b9eb58c04f 488 https://github.com/opencontainers/runc/releases/download/v1.5.2/runc.amd64.asc
+release runc 1922bc06670a35b95f9d9c0e730294482717a2660a538c4ea6d5ccba7eb665af 1239 https://github.com/opencontainers/runc/releases/download/v1.5.2/runc.sha256sum
+release runc 9bd9742cb79b215cf5f7f71ea71a51a2a95ab573412d54c2905be072d8fcab7c 8507 https://raw.githubusercontent.com/opencontainers/runc/v1.5.2/runc.keyring

@@ -1,0 +1,136 @@
+#!/bin/bash
+# Build overlay (never shipped): in an image with the NVIDIA userspace, DKMS-build the NVIDIA open modules for the image
+# kernel, signed with our Secure Boot db key,
+# plus, in lab builds only (FOILBIRD_POC_CHECKS=1), the T9 test modules and cuda-init of the PoC boot check
+# (images/debian/poc-checks). Only the .ko files land in $DESTDIR (-> image). Timestamps for the "DSA -> image" measurement.
+set -euo pipefail
+# mkosi runs build scripts in its sandbox (host tools); re-exec inside the build overlay root so headers/dkms are the image's
+if [ -z "${FOILBIRD_IN_CHROOT:-}" ]; then
+  exec mkosi-chroot env FOILBIRD_IN_CHROOT=1 SRCDIR="$CHROOT_SRCDIR" DESTDIR="$CHROOT_DESTDIR" "$CHROOT_SCRIPT" "$@"
+fi
+ts() { echo "BUILD-TS $(date +%s) $*"; }
+ts build-script-start
+KVER=$(cd /usr/src && ls -d linux-headers-*-amd64 | sed "s/^linux-headers-//" | sort -V | tail -1)
+[ -d "/usr/src/linux-headers-$KVER" ] || { echo "ERROR: no headers for $KVER" >&2; exit 1; }
+SIGN=$(ls /usr/lib/linux-kbuild-*/scripts/sign-file /usr/src/linux-headers-"$KVER"/scripts/sign-file 2>/dev/null | head -1)
+openssl x509 -in "$SRCDIR/mkosi.crt" -outform DER -out /tmp/db.der
+DBSERIAL=$(openssl x509 -in "$SRCDIR/mkosi.crt" -noout -serial | cut -d= -f2)
+echo "db cert: $(openssl x509 -in "$SRCDIR/mkosi.crt" -noout -subject) serial=$DBSERIAL"
+# NVIDIA modules only in an image with the NVIDIA userspace (variant gpu: nvidia-driver-cuda installed). An image without
+# it (variant cp) carries no NVIDIA component at all: no module, no SBOM record of one (docs/image-policy.md).
+gpu=0; dpkg-query -W -f='${Status}' nvidia-driver-cuda 2>/dev/null | grep -q 'install ok installed' && gpu=1
+echo "NVIDIA userspace in this image: $([ $gpu = 1 ] && echo yes || echo no)"
+if [ $gpu = 1 ]; then
+deb=$(ls "$SRCDIR"/nvsrc/nvidia-kernel-open-dkms_*.deb); echo "module source: $(basename "$deb") sha256=$(sha256sum "$deb" | cut -c1-64)"
+dpkg-deb -x "$deb" /
+NV=$(cd /usr/src && ls -d nvidia-* | sed 's/^nvidia-//' | sort -V | tail -1)
+echo "kernel=$KVER nvidia=$NV sign-file=$SIGN"
+# NVIDIA embeds "user@host" and `date` into nvidia.ko/nvidia-modeset.ko; pin them for a reproducible build
+EPOCH=${SOURCE_DATE_EPOCH:-$(stat -c %Y "/usr/src/nvidia-$NV/dkms.conf")}
+export NV_BUILD_USER=foilbird NV_BUILD_HOST=build DATE="date -u -d @$EPOCH"
+echo "NVIDIA build id pinned: user=$NV_BUILD_USER host=$NV_BUILD_HOST date=$(date -u -d @$EPOCH)"
+ts dkms-build-start
+dkms add -m nvidia -v "$NV"
+if ! dkms build -m nvidia -v "$NV" -k "$KVER" -j "$(nproc)"; then
+  echo "=== DKMS BUILD FAILED, make.log errors:"; grep -nE 'error:|Error [0-9]' "/var/lib/dkms/nvidia/$NV/build/make.log" | head -40
+  exit 1
+fi
+ts dkms-build-end
+# dkms 3.2 DOES sign inside the chroot, with a throwaway MOK key it generates on every build (/var/lib/dkms/mok.key, "generating
+# self signed certificate for MOK"). sign-file appends, it does not replace: without stripping, every module would ship two
+# signatures, the inner one random per build (the DKMS modules then differ between two builds). Strip every appended signature,
+# then sign once with the db key, then require exactly one.
+MODSIG_MAGIC='~Module signature appended~'
+# strip_modsig FILE: remove all appended module signatures in place; prints how many were removed
+strip_modsig() {
+  local f=$1 n=0 size signer keyid siglen
+  while [ "$(tail -c 28 "$f" | tr -d '\0')" = "$MODSIG_MAGIC" ]; do
+    # struct module_signature (12 bytes) precedes the magic: algo hash id_type signer_len key_id_len pad[3] be32 sig_len
+    read -r signer keyid siglen < <(tail -c 40 "$f" | head -c 12 | od -An -v -tu1 | tr -s ' \n' ' ' |
+      awk '{print $4, $5, $9*16777216 + $10*65536 + $11*256 + $12}')
+    size=$(stat -c %s "$f")
+    truncate -s $((size - 40 - signer - keyid - siglen)) "$f"
+    n=$((n + 1))
+  done
+  echo "$n"
+}
+# Diagnostics only (printed to the build log, nothing leaves the job): sha256 of every ELF section of the unsigned module, so a
+# CI <-> CI difference can be pinned to a section (.BTF, .note.gnu.build-id, .modinfo, .text ...) from the two logs.
+ko_sections() {
+  local k=$1 name type off size
+  readelf -SW "$k" | sed -n 's/^ *\[ *[0-9]*\] //p' | awk 'NF >= 6 && $1 != "NULL" {print $1, $2, $4, $5}' |
+  while read -r name type off size; do
+    [ "$type" = NOBITS ] && continue
+    echo "ko-section $(basename "$k") $name $((16#$size)) $(tail -c +$((16#$off + 1)) "$k" | head -c $((16#$size)) | sha256sum | cut -c1-16)"
+  done
+}
+for d in /usr/src/linux-headers-"$KVER"/scripts /usr/lib/linux-kbuild-*/scripts; do
+  [ -f "$d/Makefile.btf" ] && echo "Makefile.btf ($d): $(grep -c reproducible_build "$d/Makefile.btf") reproducible_build lines; pahole $(pahole --version 2>/dev/null || echo absent)"
+done
+src=/var/lib/dkms/nvidia/$NV/$KVER/x86_64/module
+dest=$DESTDIR/usr/lib/modules/$KVER/updates/dkms
+mkdir -p "$dest"
+for f in "$src"/*.ko*; do
+  b=$(basename "$f"); case "$b" in *.xz) xz -dc "$f" > "/tmp/${b%.xz}";; *.zst) zstd -dc "$f" > "/tmp/${b%.zst}";; *) cp "$f" "/tmp/$b";; esac
+  k=/tmp/$(basename "${b%.xz}" .zst)
+  echo "$(basename "$k"): dkms signatures stripped: $(strip_modsig "$k"); unsigned sha256 $(sha256sum "$k" | cut -c1-64)"
+  ko_sections "$k"
+  "$SIGN" sha256 "$SRCDIR/mkosi.key" /tmp/db.der "$k"
+  cp "$k" "$k.check"; n=$(strip_modsig "$k.check"); rm -f "$k.check"
+  [ "$n" = 1 ] || { echo "ERROR: $(basename "$k") has $n appended signatures after signing, expected 1" >&2; exit 1; }
+  xz -f --check=crc32 "$k"; cp "$k.xz" "$dest/"
+done
+ts sign-end
+# SBOM record for the DKMS-built modules: they belong to no dpkg package, so scanners reading dpkg status would miss them
+man=$DESTDIR/usr/share/foilbird/sbom/nvidia-open-kernel-modules.json; mkdir -p "$(dirname "$man")"
+{
+  printf '{\n  "component": "nvidia-open-kernel-modules",\n  "version": "%s",\n  "kernel": "%s",\n' "$NV" "$KVER"
+  printf '  "source": {"package": "%s", "sha256": "%s", "origin": "%s"},\n' "$(basename "$deb")" "$(sha256sum "$deb" | cut -c1-64)" "$(cat "$SRCDIR/nvsrc/origin.txt" 2>/dev/null)"
+  printf '  "built_with": {"dkms": "%s", "gcc": "%s", "headers": "%s"},\n' "$(dpkg-query -W -f '${Version}' dkms)" "$(gcc -dumpfullversion)" "$(dpkg-query -W -f '${Package} ${Version}' "linux-headers-$KVER")"
+  printf '  "license": "MIT OR GPL-2.0-only",\n  "signed_by": {"subject": "%s", "serial": "%s"},\n  "modules": [' "$(openssl x509 -in "$SRCDIR/mkosi.crt" -noout -subject | sed 's/^subject=//')" "$DBSERIAL"
+  first=1; for m in "$dest"/*; do [ $first = 1 ] || printf ','; first=0; printf '\n    {"file": "%s", "sha256": "%s"}' "${m#$DESTDIR}" "$(sha256sum "$m" | cut -c1-64)"; done
+  printf '\n  ]\n}\n'
+} > "$man"; cat "$man"
+# provenance of every NVIDIA input (tools/apt-pin.py prepare: key, signed InRelease, Packages index, each .deb, lock)
+install -m 0644 "$SRCDIR/nvsrc/nvidia-inputs.json" "$DESTDIR/usr/share/foilbird/sbom/nvidia-inputs.json"
+echo "--- signature check of every shipped NVIDIA module (must all carry our db cert)"
+total=0; ok=0
+for m in "$dest"/*; do
+  total=$((total+1)); s=$(modinfo -F signer "$m"); k=$(modinfo -F sig_key "$m" | tr -d ':' | tr a-f A-F)
+  echo "$(basename "$m") signer=[$s] sig_key=$k"; [ "$k" = "$(echo "$DBSERIAL" | tr a-f A-F)" ] && ok=$((ok+1))
+done
+echo "NV-SIGNED=$ok/$total"; [ "$ok" -eq "$total" ] && [ "$total" -gt 0 ] || { echo "ERROR: unsigned or foreign-signed NVIDIA module" >&2; exit 1; }
+else
+  echo "NVIDIA: none (no NVIDIA userspace in this image): no DKMS build, no module, no SBOM record"
+fi
+# PoC boot check inputs (lab only): never in a product image; lab-gate fails a build that carries /usr/lib/foil-poc-check
+echo "poc-checks: FOILBIRD_POC_CHECKS=[${FOILBIRD_POC_CHECKS:-}] (1 only in lab builds)"
+if [ "${FOILBIRD_POC_CHECKS:-}" = 1 ]; then
+  ts t9-start
+  cp -r "$SRCDIR/t9" /tmp/t9; make -s -C "/usr/src/linux-headers-$KVER" M=/tmp/t9 modules
+  mkdir -p "$DESTDIR/usr/lib/foil-poc-check"
+  cp /tmp/t9/t9.ko "$DESTDIR/usr/lib/foil-poc-check/t9-unsigned.ko"
+  cp /tmp/t9/t9.ko /tmp/t9-db.ko; "$SIGN" sha256 "$SRCDIR/mkosi.key" /tmp/db.der /tmp/t9-db.ko; cp /tmp/t9-db.ko "$DESTDIR/usr/lib/foil-poc-check/t9-db.ko"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj /CN=other-lab-key -keyout /tmp/o.key -out /tmp/o.crt 2>/dev/null
+  cp /tmp/t9/t9.ko /tmp/t9-other.ko; "$SIGN" sha256 /tmp/o.key /tmp/o.crt /tmp/t9-other.ko; cp /tmp/t9-other.ko "$DESTDIR/usr/lib/foil-poc-check/t9-other.ko"
+  gcc -O2 -Wall -o "$DESTDIR/usr/lib/foil-poc-check/cuda-init" "$SRCDIR/tools/cuda-init.c"
+fi
+# TPM /var key slots per PCR epoch (foil-var-epoch@.service, docs/disk-encryption.md); no shell in the image
+mkdir -p "$DESTDIR/usr/libexec"; gcc -O2 -Wall -Wextra ${FOILBIRD_VAR_EPOCH_CFLAGS:-} -o "$DESTDIR/usr/libexec/foil-var-epoch" "$SRCDIR/tools/foil-var-epoch.c"
+echo "foil-var-epoch: CFLAGS=[${FOILBIRD_VAR_EPOCH_CFLAGS:-}] (non-empty only in lab builds: -DFOILBIRD_VAR_EPOCH_LAB)"
+[ "${FOILBIRD_POC_CHECKS:-}" != 1 ] || for f in "$DESTDIR"/usr/lib/foil-poc-check/*.ko; do echo "$(basename "$f") signer=[$(modinfo -F signer "$f")]"; done
+# Historical matrix (only when 03_run_b.sh put older header sets into nvsrc/hdr/<kver>/): DKMS-build the same NVIDIA
+# version against previous trixie-security kernels; nothing from this goes to the image.
+if [ $gpu = 1 ] && [ -d "$SRCDIR/nvsrc/hdr" ]; then
+  for d in "$SRCDIR"/nvsrc/hdr/*/; do
+    k=$(basename "$d"); for f in "$d"/*.deb; do dpkg-deb -x "$f" /; done
+    t0=$(date +%s); if dkms build -m nvidia -v "$NV" -k "$k" -j "$(nproc)" > /tmp/m_$k.log 2>&1; then r=OK; else r=FAIL; grep -E 'error:' "/var/lib/dkms/nvidia/$NV/build/make.log" | head -3; fi
+    echo "MATRIX kernel=$k nvidia=$NV result=$r seconds=$(( $(date +%s) - t0 ))"
+  done
+fi
+# the boundary: an image without the NVIDIA userspace gets no NVIDIA kernel module from this script
+if [ $gpu = 0 ]; then
+  nv=$(find "$DESTDIR" \( -name 'nvidia*.ko*' -o -name 'nvidia-open-kernel-modules.json' -o -name 'nvidia-inputs.json' \) | head -3)
+  [ -z "$nv" ] || { echo "ERROR: NVIDIA component in an image without the NVIDIA userspace: $nv" >&2; exit 1; }
+fi
+ts build-script-end

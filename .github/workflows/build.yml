@@ -1,0 +1,170 @@
+# SPDX-License-Identifier: Apache-2.0
+# Reproducible build from public sources on a clean runner (docs/reproducible-build.md).
+#
+# Runs only on a push to a ci/build-try-* branch, and only for a commit that carries a build-try-* tag: the build is "by tag"
+# (`git describe --exact-match`), a commit without one fails. One job: build and tests stay in it; no upload, no cache
+# between jobs, no secrets, no third-party actions (run: steps only), read-only token used only to fetch the commit.
+# STAGE selects how far the job goes:
+#   selfcheck  the agent built for real on the pinned toolchain (agent/rust-toolchain.toml): --install-tools,
+#              cargo test of the product and both lab feature sets, build-release.sh. Then the builder: mkosi 26 at
+#              its pinned commit, the Debian snapshot reachable, the tools tree and the trixie-updates sandbox source
+#              (by building the slot initrd), facts about third-party keys
+#   gate       the publication rules (oss step) and the errexit invariant of ci/run-stage.sh (tests/ci/run-stage-errexit.sh)
+#              only: no build, a few minutes
+#   lock       first fetch of every pinned third-party file into an empty cache (apt-pin.py, fetch-upstream.py), the
+#              lock files written from the verified chain (apt-pin.py lock, fetch-upstream.py lock) and printed into the
+#              summary, verify + refusal probes against them; then the job FAILS ON PURPOSE: the locks are reviewed and
+#              committed, never taken from a run automatically
+#   cp         the k8s-worker image as built for a control plane (one image for CP and worker, the role is
+#              NodeConfig.role): NVIDIA userspace not installed, the NVIDIA open modules built from nvsrc/ and signed
+#              inside the job (never published, no upload). The agent as in selfcheck; the cache filled from the network
+#              and verified against the COMMITTED locks; ephemeral TEST keys (tests/lib/keys.sh, tmpfs);
+#              images/debian/tools/build-all.sh (the same call as on a build host): lab-gate, build manifest into the log
+#              and its stable sections into the summary
+#   gpu        the same with the NVIDIA userspace (the image of the reproducible-build criterion), plus: after the fetch both NVIDIA hosts are
+#              made unreachable (host and tools container) and the cache must carry the whole build: fetch again,
+#              refusal probes (apt-pin-test.py: changed .deb in the cache, matching sha256 without a signed chain, ...)
+#              and the build itself run with NVIDIA offline; the provenance of every input in the summary. CI <-> CI:
+#              two runs of one tag, build-manifest.py extract on both logs, then compare (only keyed lines may differ)
+#   harness    the harness gate (make test green on a clean runner): branch ci/harness-try-*, tag harness-try-*. The agent
+#              (build-release only: its tests run in the build stages), the cache and TEST keys as in cp; four harness releases of the k8s-worker profile
+#              without NVIDIA userspace (variant cp; tests/README.md "Releases and the channel"): 1 as cp, 2 3 4 with
+#              build-all.sh --image-only (2 version only, 3 + the T7 overlay, 4 epoch 2 / min 4 / pcr-e2), release
+#              epochs 1:1,2:4 on all four; tests/ci/release-channel.sh checks them offline and makes the channel of 2 3 4
+#              (TEST-signed, it never leaves the job); then make test-container STRICT=1 over every scenario. Nothing is
+#              uploaded; gpu is never built here (no NVIDIA userspace in the harness)
+# Every stage first runs the publication rules without a word list (tests/compliance/oss-gate.py): a FAIL stops the job
+# before it spends build minutes.
+# mkosi runs as root: the runner refuses unprivileged user
+# namespaces (apparmor_restrict_unprivileged_userns=1), which is not relaxed (no sysctl, no AppArmor profile), and a
+# root build was byte-for-byte deterministic. Only the build entries (foilbird-initrd/build.sh, recovery/build.sh,
+# build-image.sh; in cp through build-all.sh) run under
+# sudo, with an explicit environment (`sudo env VAR=...`, never -E); every other step runs as the runner user. The
+# preflight still prints the user-namespace outcome; the job no longer depends on it.
+# Every step body is ci/run-stage.sh (the same script .gitlab-ci.yml calls); this file only maps the GitHub variables
+# onto it (CI_TMP, CI_SUMMARY), fetches the commit and picks the steps of the stage.
+# Exit codes of the steps: 75 Debian snapshot unavailable (the run did not take place - not a reproducibility or
+# signature failure), other non-zero = failure.
+
+name: build
+
+on:
+  push:
+    branches: [ "ci/build-try-*", "ci/harness-try-*" ]
+
+permissions:
+  contents: read
+
+env:
+  STAGE: gpu
+  CI_TAG_GLOB: "build-try-*"
+  CI_LOG_GROUPS: github
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - name: Source (this commit and its build-try or harness-try tag)
+        timeout-minutes: 5
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q src && cd src
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY"
+          auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
+          git -c http.extraHeader="AUTHORIZATION: basic $auth" fetch -q --depth 1 origin "$GITHUB_SHA"
+          # the stage of the harness gate comes from the branch (ci/harness-try-*: always harness, tag harness-try-*), so the
+          # commit built is the commit merged; ci/build-try-* takes STAGE from this file and never runs harness
+          case "$GITHUB_REF_NAME:$STAGE" in
+            ci/harness-try-*:*) tp=harness-try; echo "STAGE=harness" >> "$GITHUB_ENV" ;;
+            ci/build-try-*:harness) echo "STAGE harness on branch $GITHUB_REF_NAME: harness runs only on ci/harness-try-*" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1 ;;
+            *) tp=build-try ;;
+          esac
+          echo "CI_REF=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+          git -c http.extraHeader="AUTHORIZATION: basic $auth" fetch -q --depth 1 origin "+refs/tags/$tp-*:refs/tags/$tp-*" || true
+          git checkout -q "$GITHUB_SHA"
+          echo "CI_TAG_GLOB=$tp-*" >> "$GITHUB_ENV"
+          cd .. && CI_TMP=$RUNNER_TEMP CI_SUMMARY=$GITHUB_STEP_SUMMARY CI_REF=$GITHUB_REF_NAME CI_TAG_GLOB="$tp-*" src/ci/run-stage.sh step tag
+
+      - name: Publication rules without a word list (tests/compliance/oss-gate.py, gitleaks-gate.sh; before any build)
+        timeout-minutes: 5
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          CI_GIT_AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)" CI_OWN=$GITHUB_REPOSITORY \
+            CI_TMP=$RUNNER_TEMP CI_SUMMARY=$GITHUB_STEP_SUMMARY src/ci/run-stage.sh step oss
+
+      - name: Host preflight (before the agent; never fails)
+        timeout-minutes: 2
+        run: CI_TMP=$RUNNER_TEMP CI_SUMMARY=$GITHUB_STEP_SUMMARY src/ci/run-stage.sh step preflight
+
+      - name: Errexit invariant of ci/run-stage.sh (tests/ci/run-stage-errexit.sh, no build)
+        if: env.STAGE == 'gate' || env.STAGE == 'selfcheck'
+        timeout-minutes: 10
+        run: CI_TMP=$RUNNER_TEMP CI_SUMMARY=$GITHUB_STEP_SUMMARY src/ci/run-stage.sh step errexit
+
+      - name: Agent on the pinned toolchain (install-tools, cargo test x3, build-release)
+        id: agent
+        if: env.STAGE == 'selfcheck' || env.STAGE == 'cp' || env.STAGE == 'gpu' || env.STAGE == 'harness' || startsWith(github.ref_name, 'ci/harness-try-')
+        continue-on-error: true
+        timeout-minutes: 90
+        run: CI_TMP=$RUNNER_TEMP CI_SUMMARY=$GITHUB_STEP_SUMMARY src/ci/run-stage.sh step agent
+
+      - name: Runner disk (preinstalled SDKs removed; the image build needs the space)
+        if: env.STAGE == 'cp' || env.STAGE == 'gpu' || env.STAGE == 'harness' || startsWith(github.ref_name, 'ci/harness-try-')
+        timeout-minutes: 10
+        run: CI_TMP=$RUNNER_TEMP CI_SUMMARY=$GITHUB_STEP_SUMMARY src/ci/run-stage.sh step disk
+
+      - name: Host packages and mkosi (pinned commit)
+        if: (env.STAGE != 'lock' && env.STAGE != 'gate') || startsWith(github.ref_name, 'ci/harness-try-')
+        timeout-minutes: 10
+        run: CI_TMP=$RUNNER_TEMP CI_SUMMARY=$GITHUB_STEP_SUMMARY src/ci/run-stage.sh step host
+
+      - name: Debian snapshot reachable
+        if: env.STAGE == 'selfcheck' || env.STAGE == 'cp' || env.STAGE == 'gpu' || env.STAGE == 'harness' || startsWith(github.ref_name, 'ci/harness-try-')
+        timeout-minutes: 10
+        run: CI_TMP=$RUNNER_TEMP CI_SUMMARY=$GITHUB_STEP_SUMMARY src/ci/run-stage.sh step snapshot
+
+      - name: Third-party repository keys (facts, offline analysis of the published key files)
+        if: env.STAGE != 'gate' || startsWith(github.ref_name, 'ci/harness-try-')
+        timeout-minutes: 5
+        run: CI_TMP=$RUNNER_TEMP CI_SUMMARY=$GITHUB_STEP_SUMMARY src/ci/run-stage.sh step keyfacts
+
+      - name: Slot initrd from the snapshot with the Debian tools tree
+        if: env.STAGE == 'selfcheck' && !startsWith(github.ref_name, 'ci/harness-try-')
+        timeout-minutes: 45
+        run: CI_TMP=$RUNNER_TEMP CI_SUMMARY=$GITHUB_STEP_SUMMARY src/ci/run-stage.sh step initrd
+
+      - name: Lock files from a first fetch (printed, the job fails on purpose)
+        if: env.STAGE == 'lock' && !startsWith(github.ref_name, 'ci/harness-try-')
+        timeout-minutes: 90
+        run: CI_TMP=$RUNNER_TEMP CI_SUMMARY=$GITHUB_STEP_SUMMARY src/ci/run-stage.sh step lock
+
+      - name: Image cp|gpu (k8s-worker; cp without NVIDIA userspace) by build-all.sh, from the committed locks, TEST keys
+        id: image
+        if: (env.STAGE == 'cp' || env.STAGE == 'gpu' || env.STAGE == 'harness' || startsWith(github.ref_name, 'ci/harness-try-')) && steps.agent.outcome == 'success'
+        timeout-minutes: 220
+        run: CI_TMP=$RUNNER_TEMP CI_SUMMARY=$GITHUB_STEP_SUMMARY src/ci/run-stage.sh step image
+
+      - name: Harness releases 2 3 4 (build-all.sh --image-only) and the channel (tests/ci/release-channel.sh)
+        id: harness_rel
+        if: (env.STAGE == 'harness' || startsWith(github.ref_name, 'ci/harness-try-')) && steps.image.outcome == 'success'
+        timeout-minutes: 90
+        run: CI_TMP=$RUNNER_TEMP CI_SUMMARY=$GITHUB_STEP_SUMMARY src/ci/run-stage.sh step harness_rel
+
+      - name: Harness (make test-container STRICT=1, every scenario)
+        if: (env.STAGE == 'harness' || startsWith(github.ref_name, 'ci/harness-try-')) && steps.harness_rel.outcome == 'success'
+        timeout-minutes: 120
+        run: CI_TMP=$RUNNER_TEMP CI_SUMMARY=$GITHUB_STEP_SUMMARY src/ci/run-stage.sh step harness_test
+
+      - name: Result
+        if: always() && (env.STAGE == 'selfcheck' || env.STAGE == 'cp' || env.STAGE == 'gpu' || env.STAGE == 'harness' || startsWith(github.ref_name, 'ci/harness-try-'))
+        run: |
+          echo "agent step: ${{ steps.agent.outcome }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "${{ steps.agent.outcome }}" = success ] || { echo "AGENT FAIL: fix it forward in agent/ before any other change to agent/"; exit 1; }

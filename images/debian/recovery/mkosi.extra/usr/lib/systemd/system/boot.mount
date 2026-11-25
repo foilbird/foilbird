@@ -1,0 +1,8 @@
+# The ESP, read-only: the recovery reads boot entries and never renames or writes them.
+[Unit]
+Description=ESP (read-only)
+[Mount]
+What=/dev/disk/by-partlabel/esp
+Where=/boot
+Type=vfat
+Options=ro,umask=0077

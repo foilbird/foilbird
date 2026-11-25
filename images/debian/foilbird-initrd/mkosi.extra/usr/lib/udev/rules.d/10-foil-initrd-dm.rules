@@ -1,0 +1,7 @@
+# Keep the udev database entries of device-mapper devices across switch-root (the /usr verity device is set up here),
+# so the system's udev does not treat them as new; as in mkosi's and dracut's initrds.
+SUBSYSTEM!="block", GOTO="foilbird_dm_end"
+KERNEL!="dm-[0-9]*", GOTO="foilbird_dm_end"
+ACTION!="add|change", GOTO="foilbird_dm_end"
+OPTIONS+="db_persist"
+LABEL="foilbird_dm_end"

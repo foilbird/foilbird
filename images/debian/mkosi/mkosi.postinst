@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stash the dpkg database before RemovePackages=/CleanPackageMetadata wipe /var/lib/dpkg (mkosi.finalize then drops
+# the stanzas of the packages removed afterwards). Only /usr is shipped, hence /usr/lib/foilbird/dpkg (not under a
+# .../var/lib/dpkg/status path: Grype would catalogue it as a second dpkg database and report every finding twice).
+set -eu
+[ "$1" = final ] || exit 0
+# NVIDIA modules from mkosi.build land in updates/dkms after mkosi's own depmod pass; refresh modules.dep for every kernel.
+for k in "$BUILDROOT"/usr/lib/modules/*/; do k=$(basename "$k"); mkosi-chroot depmod -a "$k"; echo "depmod $k: nvidia in modules.dep: $(grep -c 'updates/dkms/nvidia' "$BUILDROOT/usr/lib/modules/$k/modules.dep")"; done
+mkdir -p "$BUILDROOT/usr/lib/foilbird/dpkg"
+cp "$BUILDROOT/var/lib/dpkg/status" "$BUILDROOT/usr/lib/foilbird/dpkg/status"

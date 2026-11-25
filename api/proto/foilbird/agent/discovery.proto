@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Discovery of the node agent's API versions (ADR 0016).
+//
+// FROZEN from the first public release on: this package has no version and never gets one. Fields may be added; no
+// field, message, service or RPC is ever renamed, renumbered, retyped or removed (api/tools/check_proto.py against
+// discovery.fields). The package name follows the project prefix (changed at most once, with it, before that release).
+// It imports nothing versioned and carries no method options, so a new API version of the agent never touches it.
+//
+// Any client whose certificate the agent's CA signed (with the clientAuth extended key usage) may call it, whatever its
+// role: a client must be able to learn which API versions an agent serves before it can speak any of them.
+syntax = "proto3";
+
+package foilbird.agent;
+
+service Discovery {
+  // The agent's release and the API packages it serves (full names, e.g. "foilbird.agent.v1alpha1").
+  rpc GetApiVersions(GetApiVersionsRequest) returns (GetApiVersionsResponse);
+}
+
+message GetApiVersionsRequest {}
+
+message GetApiVersionsResponse {
+  // the agent's release version (no build features: Discovery answers any client of the CA)
+  string agent_version = 1;
+  // every API package the agent serves, newest first
+  repeated string served_apis = 2;
+  // reserved for a list of optional capabilities (not introduced; ADR 0016)
+  reserved 3;
+  reserved "capabilities";
+}

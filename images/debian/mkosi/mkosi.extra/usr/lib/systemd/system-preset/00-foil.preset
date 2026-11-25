@@ -1,0 +1,7 @@
+# /etc is empty on every boot: whenever /etc/machine-id is not set before PID1 starts (every boot before machine-id came from the SMBIOS UUID, now
+# a node without a usable SMBIOS UUID) systemd applies presets ("first boot"), and Debian's presets enable every
+# unit that has an [Install] section. On this image nothing is enabled by preset: the units that run are the ones wired
+# with .wants/.requires symlinks under /usr/lib/systemd/system (verity-protected). Sorted first, first match wins.
+# the agent (and nvidia-persistenced on a GPU image, mkosi.finalize) are wired by symlinks too; a preset line would not help once machine-id is stable
+# (no first boot, so presets are not applied).
+disable *

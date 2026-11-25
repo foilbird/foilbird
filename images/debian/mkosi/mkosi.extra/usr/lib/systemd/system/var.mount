@@ -1,0 +1,15 @@
+[Unit]
+Description=Persistent /var
+Documentation=file:/usr/lib/foilbird/repart.d/30-var.conf
+DefaultDependencies=no
+Wants=foil-var-unlock.service
+After=foil-var-unlock.service
+Before=local-fs.target umount.target
+Conflicts=umount.target
+
+[Mount]
+# udev (61-foil-var.rules): /dev/mapper/var for LUKS2, the partition itself for a plain ext4 /var
+What=/dev/disk/foilbird/var-fs
+Where=/var
+Type=ext4
+Options=nodev,nosuid

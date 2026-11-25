@@ -1,0 +1,32 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# k8s-worker build step: install the verified upstream release binaries (containerd, runc) and build the small
+# foil-k8s-env helper. Inputs come from tools/fetch-upstream.py prepare via /work/src/k8s-worker/upstream (bind-mounted
+# or copied there by the build wrapper). Writes SBOM records for components that are not dpkg packages.
+set -eu
+if [ -z "${FOILBIRD_IN_CHROOT:-}" ]; then
+  exec mkosi-chroot env FOILBIRD_IN_CHROOT=1 SRCDIR="$CHROOT_SRCDIR" DESTDIR="$CHROOT_DESTDIR" "$CHROOT_SCRIPT" "$@"
+fi
+P=$SRCDIR/k8s-worker; U=$P/upstream
+[ -f "$U/upstream.json" ] || { echo "ERROR: $U/upstream.json missing: run tools/fetch-upstream.py prepare first" >&2; exit 1; }
+CV=$(cat "$U/containerd.version")
+# the download script verified these; check again here so that a swapped file never reaches the image
+(cd "$U" && sha256sum -c SHA256SUMS)
+mkdir -p "$DESTDIR/usr/bin" "$DESTDIR/usr/share/foilbird/sbom" "$DESTDIR/usr/libexec/foilbird"
+tar -xzf "$U/containerd-$CV-linux-amd64.tar.gz" -C /tmp
+for b in containerd containerd-shim-runc-v2 ctr; do install -m 0755 "/tmp/bin/$b" "$DESTDIR/usr/bin/$b"; done
+install -m 0755 "$U/runc.amd64" "$DESTDIR/usr/bin/runc"
+# helper: /run/foilbird/config -> environment files for kubelet and the API proxy (no shell on the node to do it)
+export HOME=/tmp GOCACHE=/tmp/gocache GOFLAGS=-mod=mod CGO_ENABLED=0 GOTOOLCHAIN=local
+cd "$P/cmd/foil-k8s-env"
+go vet . && go test -count=1 .
+go build -trimpath -ldflags="-s -w -buildid=" -o "$DESTDIR/usr/libexec/foilbird/foil-k8s-env" .
+GOV=$(go version | cut -d' ' -f3)
+# SBOM records for files that no dpkg package owns (scanners reading dpkg status would miss them; Go buildinfo is kept)
+cp "$U/upstream.json" "$DESTDIR/usr/share/foilbird/sbom/k8s-worker-upstream.json"
+{
+  printf '{\n  "component": "foil-k8s-env",\n  "license": "Apache-2.0",\n  "built_with": "%s",\n' "$GOV"
+  printf '  "sha256": "%s"\n}\n' "$(sha256sum "$DESTDIR/usr/libexec/foilbird/foil-k8s-env" | cut -c1-64)"
+} > "$DESTDIR/usr/share/foilbird/sbom/foil-k8s-env.json"
+for f in containerd containerd-shim-runc-v2 ctr runc; do echo "$f: $(sha256sum "$DESTDIR/usr/bin/$f" | cut -c1-64)"; done
+cat "$DESTDIR/usr/share/foilbird/sbom/foil-k8s-env.json"

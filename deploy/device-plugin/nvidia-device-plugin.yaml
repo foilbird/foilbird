@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+# NVIDIA k8s-device-plugin for k8s-worker nodes, CDI mode (no NVIDIA container runtime on the node).
+# The plugin generates its CDI specification from the host driver (mounted read-only at /driver-root) into
+# /var/run/cdi and hands CDI device names to kubelet (DEVICE_LIST_STRATEGY=cdi-cri); containerd 2.x resolves them.
+# NAMESPACE, NODE_SELECTOR_KEY/VALUE and TOLERATION_* are substituted at deploy time (see README.md).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin
+  namespace: NAMESPACE
+  labels: {app.kubernetes.io/name: nvidia-device-plugin}
+spec:
+  selector:
+    matchLabels: {app.kubernetes.io/name: nvidia-device-plugin}
+  updateStrategy: {type: RollingUpdate}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: nvidia-device-plugin}
+    spec:
+      priorityClassName: system-node-critical
+      nodeSelector:
+        foilbird.com/profile: k8s-worker
+        NODE_SELECTOR_KEY: NODE_SELECTOR_VALUE
+      tolerations:
+      - {key: TOLERATION_KEY, operator: Equal, value: TOLERATION_VALUE, effect: NoSchedule}
+      - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      containers:
+      - name: nvidia-device-plugin
+        image: nvcr.io/nvidia/k8s-device-plugin:v0.20.1
+        command: ["nvidia-device-plugin"]
+        env:
+        - {name: DEVICE_LIST_STRATEGY, value: cdi-cri}
+        - {name: DEVICE_ID_STRATEGY, value: uuid}
+        - {name: NVIDIA_DRIVER_ROOT, value: /}
+        - {name: CONTAINER_DRIVER_ROOT, value: /driver-root}
+        - {name: NVIDIA_CDI_HOOK_PATH, value: /usr/bin/nvidia-cdi-hook}
+        - {name: FAIL_ON_INIT_ERROR, value: "true"}
+        - {name: MPS_ROOT, value: /run/nvidia/mps}
+        # NVML needs the device nodes; no NVIDIA runtime injects them, so the plugin runs privileged
+        securityContext: {privileged: true}
+        volumeMounts:
+        - {name: device-plugins, mountPath: /var/lib/kubelet/device-plugins}
+        - {name: driver-root, mountPath: /driver-root, readOnly: true}
+        - {name: cdi-root, mountPath: /var/run/cdi}
+      volumes:
+      - {name: device-plugins, hostPath: {path: /var/lib/kubelet/device-plugins}}
+      - {name: driver-root, hostPath: {path: /}}
+      - {name: cdi-root, hostPath: {path: /var/run/cdi, type: DirectoryOrCreate}}

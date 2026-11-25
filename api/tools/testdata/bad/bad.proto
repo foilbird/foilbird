@@ -1,0 +1,7 @@
+syntax = "proto3";
+package foilbird.agent.v1alpha1;
+service S {
+  rpc RunCommand(A) returns (A);
+  rpc Get(A) returns (A) { option (foilbird.agent.v1alpha1.access) = ACCESS_LEVEL_UNSPECIFIED; }
+}
+message A { string script_path = 1; repeated string argv = 2; bytes blob = 3; google.protobuf.Any x = 4; string hostname = 5; oneof o { string exec = 6; } map<string,string> args = 7; }

@@ -1,0 +1,33 @@
+# Decision 0002: install a release the node agent staged in /var/lib/foil-agent/staging/current into the inactive slot.
+# The agent's check is not trusted. The unit first copies the release out of the agent's reach
+# (/var/lib/foilbird/staged/<v>) and checks the copy itself: SHA256SUMS signed by the release key in /usr, every file
+# listed with its hash, the UKI version, and the floor (no release below /var/lib/foilbird/min_version or the booted
+# image's FOILBIRD_MIN_VERSION). systemd-sysupdate then installs only from that copy (sysupdate.staged.d). Started by the agent over D-Bus (org.freedesktop.systemd1 StartUnit "foil-install@<version>.service");
+# Debian's systemd 257 has no sysupdated. The agent itself never writes partitions or the ESP.
+[Unit]
+Description=Install staged release %i into the inactive slot
+# /boot is not in RequiresMountsFor= (no Requires=boot.mount): the ESP is an automount unmounted after 60 s idle
+# (boot.automount.d/50-foil-esp.conf), and its expiry queues a stop job for boot.mount that would cancel this unit's
+# start job through Requires= while it works on /var (seen in CI: "foil-install@3.service: job canceled" 77 s after
+# the start, stage-%I copying). The paths under /boot trigger the automount when used; a file held open keeps the ESP
+# mounted. docs/boot-assessment.md (ESP); the build fails on a /boot requirement (mkosi.finalize).
+RequiresMountsFor=/var/lib/foil-agent /var/lib/foilbird
+Wants=boot.automount
+After=boot.automount
+
+[Service]
+Type=oneshot
+# Fail (not skip) without a staged release: a skipped unit reports Result=success, which the agent would take as STAGED
+ExecStartPre=/usr/bin/test -L /var/lib/foil-agent/staging/current
+# copy + check (foil-var-epoch stage-<v>); refused -> the unit fails before anything is written
+ExecStartPre=/usr/bin/flock /run/foil-var-epoch.lock /usr/libexec/foil-var-epoch stage-%I
+# %I: the agent passes the version systemd-escaped (+ -> \x2b); %I is the unescaped form
+ExecStart=/usr/bin/flock /run/foil-install.lock /usr/lib/systemd/systemd-sysupdate --component=staged update %I
+TimeoutStartSec=45min
+StandardOutput=journal+console
+StandardError=journal+console
+# sysupdate exits 0 when the staged set is incomplete ("no update available"): require the new UKI on the ESP. Its
+# name is fixed: sysupdate installs it with TriesLeft=3 TriesDone=0 (90-uki.transfer). No shell (profiles may have none).
+ExecStartPost=/usr/bin/test -e /boot/EFI/Linux/foilbird-deb_%I+3-0.efi
+# the checked copy is not needed once installed
+ExecStartPost=/usr/bin/rm -rf /var/lib/foilbird/staged/%I /var/lib/foilbird/staged/current

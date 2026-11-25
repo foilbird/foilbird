@@ -1,0 +1,13 @@
+make
+qemu-system-x86
+ovmf
+swtpm
+swtpm-tools
+python3
+python3-virt-firmware
+openssl
+gnupg
+coreutils
+procps
+util-linux
+erofs-utils

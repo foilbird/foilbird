@@ -1,0 +1,16 @@
+Foilbird
+Copyright 2026 The Foilbird Authors
+
+This product includes software developed by the Foilbird Authors,
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+OS images built from this repository contain third-party packages that are
+distributed under their own licenses. See THIRD_PARTY_NOTICES.md and, for one image, its THIRD-PARTY-NOTICES.txt
+and foilbird-sbom.cdx.json (written by every image build); docs/compliance/OPEN_SOURCE_COMPLIANCE.md.
+
+Trademarks
+
+Foilbird is not affiliated with Debian. Debian is a registered trademark owned by Software in the Public Interest, Inc.
+Linux® is the registered trademark of Linus Torvalds in the U.S. and other countries.
+Kubernetes® is a registered trademark of The Linux Foundation in the United States and/or other countries.
+NVIDIA and the NVIDIA logo are trademarks and/or registered trademarks of NVIDIA Corporation in the U.S. and other countries.

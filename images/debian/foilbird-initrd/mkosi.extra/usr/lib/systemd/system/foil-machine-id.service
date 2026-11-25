@@ -1,0 +1,15 @@
+# Stable machine-id: /etc is a tmpfs, so without this the id is new on every boot (systemd uses the DMI UUID only under
+# KVM). Written into the new root before systemd there initializes the id; same rule on VMs and hardware.
+[Unit]
+Description=Machine ID from the SMBIOS system UUID
+DefaultDependencies=no
+After=sysroot.mount
+Requires=sysroot.mount
+Before=initrd-root-fs.target initrd-switch-root.target
+ConditionPathExists=/etc/initrd-release
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/foil-machine-id
+StandardOutput=journal+console

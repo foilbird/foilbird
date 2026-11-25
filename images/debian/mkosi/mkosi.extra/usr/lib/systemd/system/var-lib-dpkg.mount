@@ -1,0 +1,16 @@
+[Unit]
+Description=dpkg database, read-only from /usr, for vulnerability scanners
+Documentation=file:/usr/lib/foilbird/dpkg/status
+# A regular file in place, not a link: Trivy does not follow links and then finds no packages. A bind mount, not a
+# copy: /var is persistent, a copy would go stale after an update; the bind always shows the booted /usr. Binding the
+# directory also hides the link earlier releases left in /var/lib/dpkg.
+DefaultDependencies=no
+RequiresMountsFor=/var /usr
+Before=local-fs.target umount.target
+Conflicts=umount.target
+
+[Mount]
+What=/usr/lib/foilbird/dpkg
+Where=/var/lib/dpkg
+Type=none
+Options=bind,ro,nodev,nosuid,noexec

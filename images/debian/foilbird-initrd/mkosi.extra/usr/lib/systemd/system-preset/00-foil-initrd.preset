@@ -1,0 +1,5 @@
+# As in the image (00-foil.preset): presets enable nothing in the initrd. 00- sorts before Debian's 90-systemd.preset,
+# whose "enable" lines would otherwise win (getty, networkd, pstore, sysext links in /etc/systemd/system, seen in
+# mkosi's default initrd and in a 99- variant of this file). What the initrd runs is pulled in by systemd's static
+# dependencies (initrd.target) and the symlinks in this tree.
+disable *

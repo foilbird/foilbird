@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+# containerd 2.x configuration of the k8s-worker profile. Socket stays local (no remote container API on the node).
+version = 3
+root = '/var/lib/containerd'
+state = '/run/containerd'
+
+[grpc]
+  address = '/run/containerd/containerd.sock'
+
+[plugins.'io.containerd.cri.v1.runtime']
+  enable_cdi = true
+  cdi_spec_dirs = ['/etc/cdi', '/var/run/cdi']
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc.options]
+  SystemdCgroup = true
+
+[plugins.'io.containerd.cri.v1.runtime'.cni]
+  bin_dirs = ['/opt/cni/bin']
+  conf_dir = '/etc/cni/net.d'
+
+# Drop compressed layer blobs once unpacked: without it a large image (vLLM ~8.6 GB compressed) is stored twice on
+# /var and the node hits DiskPressure (seen on a 40 GB disk). Re-pulls download again.
+[plugins.'io.containerd.cri.v1.images']
+  discard_unpacked_layers = true
+
+# The pod sandbox image is the one kubeadm 1.34 expects (`kubeadm config images list`: pause:3.10.1); containerd
+# 2.3.7 would default to 3.10.2, so kubelet (--pod-infra-container-image from kubeadm) and containerd referred to two
+# images. Pulled like any registry.k8s.io image (mirrors in NodeConfig.registries).
+[plugins.'io.containerd.cri.v1.images'.pinned_images]
+  sandbox = 'registry.k8s.io/pause:3.10.1'
+
+# Registry hosts (mirrors, CAs): rendered by the node agent into /run/foilbird/containerd/certs.d (hosts.toml per registry);
+# empty until then. /etc/containerd/certs.d is the conventional location for local tests.
+[plugins.'io.containerd.cri.v1.images'.registry]
+  config_path = '/run/foilbird/containerd/certs.d:/etc/containerd/certs.d'

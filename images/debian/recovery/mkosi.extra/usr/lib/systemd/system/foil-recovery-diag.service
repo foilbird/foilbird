@@ -1,0 +1,11 @@
+# Read-only diagnosis of both A/B slots on every recovery boot (decision 0003).
+[Unit]
+Description=Diagnose both A/B slots (read-only)
+After=boot.mount
+Wants=boot.mount
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/foil-recovery-diag
+StandardOutput=journal+console
+StandardError=journal+console

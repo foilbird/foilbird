@@ -1,0 +1,71 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# k8s-worker finalize (runs after the base image's finalize):
+# - only /usr is shipped: CNI plugins of kubernetes-cni live in /opt/cni/bin -> move to /usr/lib/cni, tmpfiles links them;
+# - drop dpkg-status stanzas of the shells and of mawk removed by RemoveFiles= (a phantom entry gives false scanner hits);
+# - fail the build if a shell, an interpreter or a script with its interpreter is left (T5:
+#   images/debian/tools/t5-check; it reports login and getty too, the console-login block below gates them);
+# - fail the build if a console login is possible.
+set -eu
+# the profile of this image, read by the node agent (health checks: kubelet-healthy for k8s-worker)
+grep -q '^FOILBIRD_PROFILE=' "$BUILDROOT/usr/lib/os-release" || echo 'FOILBIRD_PROFILE=k8s-worker' >> "$BUILDROOT/usr/lib/os-release"
+grep '^FOILBIRD_PROFILE=' "$BUILDROOT/usr/lib/os-release"
+if [ -d "$BUILDROOT/opt/cni/bin" ]; then
+  mkdir -p "$BUILDROOT/usr/lib/cni"; cp -a "$BUILDROOT/opt/cni/bin/." "$BUILDROOT/usr/lib/cni/"
+  tf="$BUILDROOT/usr/lib/tmpfiles.d/foil-cni.conf"; echo "d /opt/cni/bin 0755 root root -" > "$tf"
+  for f in "$BUILDROOT"/usr/lib/cni/*; do echo "L /opt/cni/bin/$(basename "$f") - - - - /usr/lib/cni/$(basename "$f")" >> "$tf"; done
+  echo "cni plugins -> /usr/lib/cni: $(ls "$BUILDROOT/usr/lib/cni" | tr '\n' ' ')"
+fi
+# control plane v0: kubeadm mounts /usr/libexec/kubernetes/kubelet-plugins/volume/exec into kube-controller-manager
+# (hostPath DirectoryOrCreate); /usr is read-only, so the directory ships empty in the image. FlexVolume is thus off
+# (no driver can be installed), as on Talos; the alternative, flex-volume-plugin-dir in the operator's init, would
+# push an OS detail onto every init configuration.
+mkdir -p "$BUILDROOT/usr/libexec/kubernetes/kubelet-plugins/volume/exec"
+st="$BUILDROOT/usr/lib/foilbird/dpkg/status"
+awk -v RS= -v ORS='\n\n' '!/^Package: (dash|bash|klibc-utils|libklibc|mawk)\n/' "$st" > "$st.new" && mv "$st.new" "$st"; chmod 0644 "$st"
+echo "dpkg status after shell removal: $(grep -c '^Package:' "$st") packages"
+# summary lines in the build log; every finding when the gate fails
+t5=0; out=$(T5_GATE="shells interpreters scripts" sh "$SRCDIR/image-tools/t5-check" "$BUILDROOT") || t5=$?
+if [ "$t5" = 0 ]; then printf '%s\n' "$out" | grep -v '^  '; else printf '%s\n' "$out"; echo "T5 gate failed (rc=$t5)"; exit 1; fi
+! grep -qE '^Package: (dash|bash|klibc-utils|libklibc|mawk)$' "$st" || { echo "T5: shell or interpreter package still in $st"; exit 1; }
+# No console login - no login tool, no PAM stack for one, every getty unit masked and none pulled in by a target
+tools="agetty getty mingetty login su sulogin runuser systemd-sulogin-shell passwd chsh chfn chpasswd chgpasswd newusers vipw vigr newgrp sg gpasswd chage expiry"
+left=$(for t in $tools; do for d in usr/bin usr/sbin usr/lib/systemd; do [ -e "$BUILDROOT/$d/$t" ] || [ -L "$BUILDROOT/$d/$t" ] && echo "/$d/$t"; done
+  [ -e "$BUILDROOT/etc/pam.d/$t" ] && echo "/etc/pam.d/$t"; done; for f in etc/pam.d/su-l etc/pam.d/runuser-l etc/securetty; do [ -e "$BUILDROOT/$f" ] && echo "/$f"; done; true)
+[ -z "$left" ] || { echo "console login: login tool or PAM stack left: $left"; exit 1; }
+for u in getty.target getty@.service serial-getty@.service console-getty.service container-getty@.service autovt@.service getty-static.service debug-shell.service; do
+  [ "$(readlink "$BUILDROOT/usr/lib/systemd/system/$u")" = /dev/null ] || { echo "console login: $u is not masked"; exit 1; }
+done
+# only /usr is shipped: links that systemd's package scripts leave in the build root's /etc/systemd (getty@tty1) never
+# reach the node (/etc is tmpfs, etc/systemd is not copied to the factory, the base preset is "disable *")
+w=$( { find "$BUILDROOT/usr/lib/systemd/system" \( -path '*.wants/*' -o -path '*.requires/*' \); \
+  grep -h '/etc/systemd' "$BUILDROOT"/usr/lib/tmpfiles.d/*.conf; find "$BUILDROOT/usr/share/factory/etc" -path '*systemd*'; } 2>/dev/null \
+  | grep -E 'getty|debug-shell' | sed "s|^$BUILDROOT||")
+[ -z "$w" ] || { echo "console login: getty pulled in: $w"; exit 1; }
+[ ! -e "$BUILDROOT/usr/lib/systemd/system-generators/systemd-getty-generator" ] || { echo "console login: systemd-getty-generator present"; exit 1; }
+echo "console login: no login tools, getty units masked, no getty in *.wants/*.requires"
+for p in kubelet kubeadm cri-tools kubernetes-cni nvidia-container-toolkit-base iptables; do
+  echo "$p: $(awk -v RS= -v p="$p" '$0 ~ "^Package: "p"\n" {match($0,/Version: [^\n]*/); print substr($0,RSTART+9,RLENGTH-9)}' "$st")"
+done
+# NVIDIA only in an image with the NVIDIA userspace, by the base's sign (nvidia-persistenced.service, see
+# images/debian/mkosi/mkosi.finalize). There: foil-nvidia-cdi and its multi-user.target.wants link, and the toolkit's
+# nvidia-cdi-refresh.{path,service} masked (its refresh unit needs /bin/sh, which the image does not have;
+# foil-nvidia-cdi writes the spec on every boot). Without it: none of these, and no NVIDIA package in dpkg status
+# (Package nvidia*/libnvidia*, or NVIDIA in Maintainer or Source; build-all.sh installs no NVIDIA set for cp)
+u=$BUILDROOT/usr/lib/systemd/system
+if [ -f "$u/nvidia-persistenced.service" ]; then
+  install -m 0644 "${SRCDIR:?}/k8s-worker/nvidia/foil-nvidia-cdi.service" "$u/foil-nvidia-cdi.service"
+  mkdir -p "$u/multi-user.target.wants"; ln -sfn ../foil-nvidia-cdi.service "$u/multi-user.target.wants/foil-nvidia-cdi.service"
+  ln -sfn /dev/null "$u/nvidia-cdi-refresh.path"; ln -sfn /dev/null "$u/nvidia-cdi-refresh.service"
+  echo "foil-nvidia-cdi: installed and enabled; nvidia-cdi-refresh masked (NVIDIA userspace)"
+else
+  for f in foil-nvidia-cdi.service multi-user.target.wants/foil-nvidia-cdi.service nvidia-cdi-refresh.path nvidia-cdi-refresh.service nvidia-cdi-refresh.service.d; do
+    if [ -e "$u/$f" ] || [ -L "$u/$f" ]; then echo "ERROR: $f in an image without the NVIDIA userspace" >&2; exit 1; fi
+  done
+  nvp=$(awk -v RS= '{ p = m = s = ""; n = split($0, a, "\n")
+      for (i = 1; i <= n; i++) { if (a[i] ~ /^Package: /) p = substr(a[i], 10); if (a[i] ~ /^Maintainer: /) m = substr(a[i], 13); if (a[i] ~ /^Source: /) s = substr(a[i], 9) }
+      if (tolower(p) ~ /^(lib)?nvidia/ || tolower(m) ~ /nvidia/ || tolower(s) ~ /nvidia/) print "Package: " p " | Maintainer: " m }' "$st")
+  [ -z "$nvp" ] || { echo "ERROR: NVIDIA package in an image without the NVIDIA userspace:" >&2; printf '%s\n' "$nvp" >&2; exit 1; }
+  echo "NVIDIA in k8s-worker: none (no foil-nvidia-cdi, no nvidia-cdi-refresh, no NVIDIA package in dpkg status)"
+fi
+# The SBOM is written at the end of the base image's mkosi.finalize, which mkosi runs after this one

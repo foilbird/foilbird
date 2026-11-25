@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Render kubelet flags and the API endpoint from the node configuration
+After=foil-config.service foil-bridge.service
+Before=kubelet.service foil-apiserver-proxy.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/foilbird/foil-k8s-env
+
+[Install]
+RequiredBy=kubelet.service

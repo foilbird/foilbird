@@ -1,0 +1,19 @@
+[Transfer]
+Verify=yes
+# Not a default: without it sysupdate treats the newest *installed* version as current and may vacuum the booted
+# slot (the booted release would be erased once a newer one is installed but bad).
+ProtectVersion=%A
+
+[Source]
+Type=url-file
+Path=https://updates.example.invalid/foilbird-deb/
+MatchPattern=foilbird-deb_@v.usr-x86-64-verity.@u.raw.xz
+
+[Target]
+Type=partition
+Path=auto
+MatchPartitionType=usr-verity
+MatchPattern=usr-verity_@v
+ReadOnly=1
+# InstancesMax= belongs to [Target]
+InstancesMax=2

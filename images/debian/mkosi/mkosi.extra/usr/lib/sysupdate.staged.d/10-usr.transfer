@@ -1,0 +1,21 @@
+[Transfer]
+# Decision 0002: the agent has verified the whole release in staging (signature, hashes, version, completeness)
+# before pointing current at it; a local regular-file source is not re-verified by sysupdate.
+Verify=no
+# Not a default: without it sysupdate treats the newest *installed* version as current and may vacuum the booted
+# slot (the booted release would be erased once a newer one is installed but bad).
+ProtectVersion=%A
+
+[Source]
+Type=regular-file
+Path=/var/lib/foilbird/staged/current
+MatchPattern=foilbird-deb_@v.usr-x86-64.@u.raw.xz
+
+[Target]
+Type=partition
+Path=auto
+MatchPartitionType=usr
+MatchPattern=usr_@v
+ReadOnly=1
+# InstancesMax= belongs to [Target]
+InstancesMax=2

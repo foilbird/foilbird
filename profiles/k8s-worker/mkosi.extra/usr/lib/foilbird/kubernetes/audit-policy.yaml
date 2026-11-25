@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# kube-apiserver audit policy of the control plane: every request at Metadata (who, what, when, verb, resource,
+# response code), never a request or response body. Bootstrap (join) tokens and every other credential live in Secrets
+# and token APIs, so their rule pins Metadata even if the default below is ever raised. Used by the operator's
+# ClusterConfiguration (profile README, "Control plane audit log"); the file is in the signed /usr.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: [RequestReceived]
+rules:
+# Credentials: metadata only, whatever the default.
+- level: Metadata
+  resources:
+  - group: ""
+    resources: [secrets, configmaps, serviceaccounts/token]
+  - group: authentication.k8s.io
+    resources: [tokenreviews]
+  - group: certificates.k8s.io
+    resources: [certificatesigningrequests]
+# Noise without an actor of interest: health probes, node and leader-election lease renewals.
+- level: None
+  nonResourceURLs: [/healthz*, /livez*, /readyz*, /version]
+- level: None
+  verbs: [get, update]
+  resources:
+  - group: coordination.k8s.io
+    resources: [leases]
+# Everything else.
+- level: Metadata

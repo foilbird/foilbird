@@ -1,0 +1,23 @@
+# UKI last: until it lands in /EFI/Linux the new slot is not bootable. New entry starts with 3 tries (+3-0).
+[Transfer]
+Verify=yes
+# Not a default: without it sysupdate treats the newest *installed* version as current and may vacuum the booted
+# slot (the booted release would be erased once a newer one is installed but bad).
+ProtectVersion=%A
+
+[Source]
+Type=url-file
+Path=https://updates.example.invalid/foilbird-deb/
+MatchPattern=foilbird-deb_@v.efi
+
+[Target]
+Type=regular-file
+Path=/EFI/Linux
+PathRelativeTo=boot
+MatchPattern=foilbird-deb_@v+@l-@d.efi foilbird-deb_@v+@l.efi foilbird-deb_@v.efi
+Mode=0644
+# 3 tries: foil-install@.service checks for <id>_<version>+3-0.efi; change both together
+TriesLeft=3
+TriesDone=0
+# InstancesMax= belongs to [Target]
+InstancesMax=2
