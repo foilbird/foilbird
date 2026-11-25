@@ -116,7 +116,8 @@ fi
 fpr=$(echo "$fprs" | tr -d ' ')
 mkdir -p "$out"
 cd "$profile"
-mkosi -f "${incl[@]}" --image-version="$version" --output-dir="$out" --extra-tree="$gen:/" \
+. "$here/tools/mkosi-offline.sh"   # NL_PKGCACHE / NL_OFFLINE -> mkosi options
+mkosi -f "${incl[@]}" "${mkosi_offline[@]}" --image-version="$version" --output-dir="$out" --extra-tree="$gen:/" \
   --environment=FOILBIRD_RELEASE_KEY_FPR="$fpr" --environment=FOILBIRD_PCR_EPOCH="$epoch" \
   --environment=FOILBIRD_MIN_VERSION="$minv" ${epochs:+--environment=FOILBIRD_RELEASE_EPOCHS="$epochs"} \
   --sign-expected-pcr-key="$pcrkey" --sign-expected-pcr-certificate="$pcrcert" --seed="$seed" "$@" build

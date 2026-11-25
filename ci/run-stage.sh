@@ -15,17 +15,21 @@
 #   cp | gpu   preflight tag oss agent disk host snapshot keyfacts image  (image only after a passing agent step)
 #   harness    preflight tag oss agent disk host snapshot keyfacts image harness_rel harness_test  (the harness gate:
 #              make test STRICT=1 against releases 1-4 built in the job; tag harness-try-*)
-# Steps: preflight tag oss errexit agent disk host snapshot keyfacts initrd lock image harness_rel harness_test result
+#   offline    as cp (NL_PKGCACHE: mkosi's package cache), then offline_bundle offline_probes offline_clean offline_net
+#              offline_build offline_compare (ci/offline.sh)
+# Steps: preflight tag oss errexit agent disk host snapshot keyfacts initrd lock image harness_rel harness_test offline_* result
 # Every step runs in a process of its own (`bash ci/run-stage.sh __step <name>`, started by run_step): a step body called
 # from `"step_x" || rc=$?` (or under if/&&/!) runs with errexit ignored - its own `set -e` would do nothing (bash(1)) - so
 # a step never runs inside such a context; what a step decides on is still read explicitly (rc, PIPESTATUS, exit).
 # The child gets the state through the environment only: CI_TMP, CI_SUMMARY, STAGE, CI_TAG_GLOB, CI_REF, CI_GIT_AUTH,
-# CI_OWN, CI_LOG_GROUPS, MKOSI_*, DEBIAN_IMAGE, PATH (exported); files under CI_TMP (agent.outcome, dist, cache) are shared.
+# CI_OWN, CI_LOG_GROUPS, MKOSI_*, DEBIAN_IMAGE, PATH, NL_PKGCACHE (offline stage) (exported); files under CI_TMP
+# (agent.outcome, dist, cache) are shared.
 #
 # Environment (the CI maps its own variables onto these; nothing CI-specific below):
 #   CI_TMP        work directory outside the tree (required): agent dist, cache, logs, mkosi, output
 #   CI_SUMMARY    file the summary lines are appended to (default: $CI_TMP/summary.md)
-#   STAGE         gate | selfcheck | lock | cp | gpu | harness (the agent, image and harness steps read it)
+#   STAGE         gate | selfcheck | lock | cp | gpu | harness | offline (the agent, image and harness steps read it;
+#                 offline builds its online image as cp)
 #   CI_TAG_GLOB   the tag the commit must carry, the build is "by tag" (default build-try-*; harness: harness-try-*)
 #   CI_REF        the branch being built: a ci/harness-try-* branch is always STAGE=harness (the stage of the harness gate
 #                 comes from the branch, so the commit built is the commit merged)
@@ -44,6 +48,27 @@ T=${CI_TMP:?CI_TMP: a work directory outside the tree}
 mkdir -p "$T"
 SUM=${CI_SUMMARY:-$T/summary.md}
 CI_SUMMARY=$SUM; export CI_TMP CI_SUMMARY
+# NL_SHARED_HOST=1: a build host that outlives the job and serves others (a GitLab runner, as root): the job changes
+# nothing of the host outside CI_TMP. HOME is in CI_TMP (cargo, rustup); the TEST keys are in CI_TMP, not on the tmpfs path
+# every job shares; the disk step removes no toolchain and prunes no docker image; no apt-get (the host packages are
+# installed beforehand, a missing one fails its step by name); the offline stage puts the agent's shared tools set aside
+# and puts it back on the way out. Unset (GitHub Actions, a fresh runner per job): none of this, as before.
+CI_TEST_KEYS=/dev/shm/ci-test-keys
+if [ "${NL_SHARED_HOST:-0}" = 1 ]; then HOME=$T/home; mkdir -p "$HOME"; CI_TEST_KEYS=$T/test-keys; fi
+export HOME CI_TEST_KEYS
+# docker on a host several jobs share (GitLab: NL_DOCKER_TAG = the job id): the job's containers and image carry it in
+# their names, are removed when the stage starts and on its way out; NL_DOCKER_CPUS caps each container (docker's own
+# cgroup is outside the runner's CPU quota). Both empty (GitHub Actions): the names and runs before, no cap
+case ${NL_DOCKER_TAG:-} in *[!A-Za-z0-9_.-]*) echo "run-stage.sh: NL_DOCKER_TAG [$NL_DOCKER_TAG]: only A-Za-z0-9_.-" >&2; exit 2 ;; esac
+case ${NL_DOCKER_CPUS:-} in *[!0-9.]*) echo "run-stage.sh: NL_DOCKER_CPUS [$NL_DOCKER_CPUS]: a number" >&2; exit 2 ;; esac
+DK_TOOLS=o2tools${NL_DOCKER_TAG:+-$NL_DOCKER_TAG}; DK_OFF=$DK_TOOLS-off; DK_IMG=nl-o2tools-offline${NL_DOCKER_TAG:+-$NL_DOCKER_TAG}
+export DK_TOOLS DK_OFF DK_IMG
+DCPU=(); [ -z "${NL_DOCKER_CPUS:-}" ] || DCPU=(--cpus "$NL_DOCKER_CPUS")
+dk_clean() { [ -n "${NL_DOCKER_TAG:-}" ] || return 0
+  docker rm -f "$DK_TOOLS" "$DK_OFF" >/dev/null 2>&1 || true; docker image rm -f "$DK_IMG" >/dev/null 2>&1 || true; }
+# shared host: the packages a step needs must be there (nothing installed); prints the missing ones, rc 1
+host_has() { local p s m=; for p in "$@"; do s=$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null) || s=; [ "$s" = "install ok installed" ] || m="$m $p"; done
+  [ -z "$m" ] || { echo "shared host: packages missing (install them once as root):$m"; return 1; }; }
 MKOSI_TAG=${MKOSI_TAG:-v26}
 MKOSI_COMMIT=${MKOSI_COMMIT:-84af20892b61c8e177e391f997ded8b4cb5514f2}
 # Debian 13 for the tools that need Debian's own versions (sqv of apt-pin.py); the same pinned digest as test.yml
@@ -158,13 +183,15 @@ if out=$(unshare --user --map-root-user true 2>&1); then u="ok"; else u="FAIL: $
 echo "PREFLIGHT kernel $(uname -r); apparmor_restrict_unprivileged_userns=$r unprivileged_userns_clone=$c max_user_namespaces=$m; unshare --user --map-root-user (as $(id -un)): $u" | tee -a "$SUM"
 echo "mkosi as root; user namespaces not needed, not relaxed" | tee -a "$SUM"
 echo "pins (ci/run-stage.sh): mkosi $MKOSI_TAG $MKOSI_COMMIT; tools image $DEBIAN_IMAGE" | tee -a "$SUM"
+echo "locale of the job: LANG=${LANG:-unset} LC_ALL=${LC_ALL:-unset} LC_COLLATE=${LC_COLLATE:-unset} (sorting in this script: LC_ALL=C)" | tee -a "$SUM"
 )
 
 # the agent on the pinned toolchain: install-tools, cargo test x3, build-release -> $T/dist
 step_agent() (
 set -eo pipefail
 set +e -uo pipefail   # no errexit here: the failures that decide this step are read explicitly below (rc, fail, exit)
-sudo apt-get update -q >/dev/null && sudo apt-get install -y -q --no-install-recommends musl-tools >/dev/null
+if [ "${NL_SHARED_HOST:-0}" = 1 ]; then host_has musl-tools rustup || exit 1
+else sudo apt-get update -q >/dev/null && sudo apt-get install -y -q --no-install-recommends musl-tools >/dev/null; fi
 cd "$TOP/agent"
 rustup show active-toolchain || rustup toolchain install   # rust-toolchain.toml: 1.100.0 + musl target
 line="agent: rustc $(rustc --version | cut -d' ' -f2-)"
@@ -203,6 +230,7 @@ set -uo pipefail
 # the image adds a third tools tree and the build overlay. Removed: toolchains this job never uses (none of them is
 # a build input), docker images other than the tools image are pulled later
 before=$(df -h / | awk 'NR==2{print $4}')
+if [ "${NL_SHARED_HOST:-0}" = 1 ]; then echo "runner disk: shared host, nothing removed; free on / $before" | tee -a "$SUM"; exit 0; fi
 sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
   /usr/local/share/boost /usr/share/swift /usr/local/julia* /opt/az /usr/local/share/powershell /opt/microsoft
 docker image prune -a -f >/dev/null 2>&1 || true
@@ -213,11 +241,15 @@ echo "runner disk: free on / $before -> $(df -h / | awk 'NR==2{print $4}')" | te
 step_host() (
 set -eo pipefail
 set -euo pipefail
+# erofs-utils: fsck.erofs for lab-gate and build-manifest.py (they read the /usr image after the build)
+pk="uidmap debian-archive-keyring python3 git gnupg openssl erofs-utils"
+if [ "${NL_SHARED_HOST:-0}" = 1 ]; then r=0; host_has $pk || r=$?; [ $r = 0 ] || { echo "HOST FAIL: shared host packages" | tee -a "$SUM"; exit 1; }
+else
 r=0; sudo apt-get update -q >/dev/null || r=$?
 [ $r = 0 ] || { echo "HOST FAIL: apt-get update rc=$r" | tee -a "$SUM"; exit 1; }
-# erofs-utils: fsck.erofs for lab-gate and build-manifest.py (they read the /usr image after the build)
-r=0; sudo apt-get install -y -q --no-install-recommends uidmap debian-archive-keyring python3 git gnupg openssl erofs-utils >/dev/null || r=$?
+r=0; sudo apt-get install -y -q --no-install-recommends $pk >/dev/null || r=$?
 [ $r = 0 ] || { echo "HOST FAIL: apt-get install rc=$r" | tee -a "$SUM"; exit 1; }
+fi
 git clone -q --depth 1 --branch "$MKOSI_TAG" https://github.com/systemd/mkosi "$T/mkosi"
 got=$(git -C "$T/mkosi" rev-parse HEAD)
 [ "$got" = "$MKOSI_COMMIT" ] || { echo "mkosi $MKOSI_TAG is $got, pinned $MKOSI_COMMIT"; exit 1; }
@@ -312,9 +344,9 @@ L=$T/lock.log; : > "$L"
 # Debian snapshot (reproducible.conf). Mounted: the tree (/src, the locks are written there), the cache, a work dir.
 ts=$(sh images/debian/tools/snapshot check) || exit 1
 mkdir -p "$T/apt-cache" "$T/work"
-docker run -d --name o2tools -v "$PWD:/src" -v "$T/apt-cache:/cache" -v "$T/work:/work" -w /src \
+docker run -d "${DCPU[@]}" --name "$DK_TOOLS" -v "$PWD:/src" -v "$T/apt-cache:/cache" -v "$T/work:/work" -w /src \
   "$DEBIAN_IMAGE" sleep infinity >/dev/null || { echo "docker run $DEBIAN_IMAGE failed"; exit 1; }
-X="docker exec -w /src o2tools"; cache=/cache
+X="docker exec -w /src $DK_TOOLS"; cache=/cache
 srcs="Types: deb\nURIs: http://snapshot.debian.org/archive/debian/$ts\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/$ts\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n"
 ok=0
 for d in 0 30 90; do
@@ -384,9 +416,9 @@ mkdir -p "$cache"
 # tools that need Debian 13's sqv (apt-pin.py, fetch-upstream.py) run in Debian 13 (pinned digest, packages from
 # the build's own snapshot), as in the lock stage; the tree and the cache are mounted at THE SAME paths, so
 # build-all.sh passes host paths through TOOLS_EXEC unchanged
-docker run -d --name o2tools -v "$PWD:$PWD" -v "$cache:$cache" -w "$PWD" "$DEBIAN_IMAGE" sleep infinity >/dev/null ||
+docker run -d "${DCPU[@]}" --name "$DK_TOOLS" -v "$PWD:$PWD" -v "$cache:$cache" -w "$PWD" "$DEBIAN_IMAGE" sleep infinity >/dev/null ||
   { echo "docker run $DEBIAN_IMAGE failed"; exit 1; }
-X="docker exec -w $PWD o2tools"
+X="docker exec -w $PWD $DK_TOOLS"
 srcs="Types: deb\nURIs: http://snapshot.debian.org/archive/debian/$ts\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/$ts\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n"
 ok=0
 for d in 0 30 90; do
@@ -433,8 +465,8 @@ if [ "$STAGE" = gpu ]; then
   { echo '<details><summary>probe lines</summary>'; echo; echo '```'; grep -E '^[a-z0-9-]+ (P0|N[0-9])' "$P"; echo '```'; echo '</details>'; } >> "$SUM"
   [ $pf = 0 ] || { tail -n 30 "$P"; echo "PROBES FAIL" | tee -a "$SUM"; exit 1; }
 fi
-# ephemeral TEST keys on tmpfs, never leave the job
-keys=/dev/shm/ci-test-keys
+# ephemeral TEST keys on tmpfs (a shared host: in CI_TMP), never leave the job
+keys=$CI_TEST_KEYS
 tests/lib/keys.sh gen "$keys" > "$T/keys.txt" && tests/lib/keys.sh check "$keys" || { echo "TEST keys: keys.sh failed"; exit 1; }
 { echo "TEST keys (ephemeral, tmpfs, this job only):"; echo '```'; cat "$T/keys.txt"; echo '```'; } >> "$SUM"
 df -h / "$T" | tail -n +2
@@ -468,11 +500,11 @@ live=$(sed -n 's/^LIVE //p' "$T/sources.txt")
   echo "apt Get/Hit from snapshot.debian.org: $(grep -c -E '^(Get|Hit):[0-9]+ https://snapshot\.debian\.org' "$B")"
   echo "apt Get/Hit from any other host: $(grep -E '^(Get|Hit):[0-9]+ (https?|ftp)://' "$B" | grep -v -c 'https://snapshot\.debian\.org')"
   # by source (scheme://host/first path part): what "other" is, by name
-  echo "apt Get/Hit by source: $(grep -o -E '^(Get|Hit):[0-9]+ [a-z]+:/*[^/ ]*/[^/ ]*' "$B" | cut -d' ' -f2 | sort | uniq -c | awk '{printf "%s %s; ", $2, $1}')"
+  echo "apt Get/Hit by source: $(grep -o -E '^(Get|Hit):[0-9]+ [a-z]+:/*[^/ ]*/[^/ ]*' "$B" | cut -d' ' -f2 | LC_ALL=C sort | LC_ALL=C uniq -c | awk '{printf "%s %s; ", $2, $1}')"
   grep -E '^(Get|Hit):[0-9]+ (https?|ftp)://' "$B" | grep -v 'https://snapshot\.debian\.org' | head -n 5 | sed 's/^/  other: /'
   echo "trixie-updates source used: $(grep -c -E 'snapshot\.debian\.org/archive/debian/[0-9T]+Z trixie-updates' "$B")"
   # the aptpin sandbox tree is what apt reads (file:/srv/apt-pin/<set>/)
-  echo "apt-pin sandbox source used (file:/srv/apt-pin): $(grep -c 'file:/srv/apt-pin' "$B"), sets: $(grep -o 'file:/srv/apt-pin/[a-z0-9-]*' "$B" | sort -u | tr '\n' ' ')"
+  echo "apt-pin sandbox source used (file:/srv/apt-pin): $(grep -c 'file:/srv/apt-pin' "$B"), sets: $(grep -o 'file:/srv/apt-pin/[a-z0-9-]*' "$B" | LC_ALL=C sort -u | tr '\n' ' ')"
   [ -f "$out/build-params.txt" ] && { echo '```'; cat "$out/build-params.txt"; echo '```'; }
   [ -f "$out/lab-gate.txt" ] && echo "lab-gate: $(tail -n 1 "$out/lab-gate.txt")"
 } | tee -a "$SUM"
@@ -481,8 +513,8 @@ if [ -f "$M" ]; then
   {
     echo "build manifest: $(grep -vc '^#' "$M") lines, sha256 $(sha256sum < "$M" | cut -c1-64)"
     echo "stable part (without keyed lines): sha256 $(grep -v -e '^#' -e '^keyed ' "$M" | sha256sum | cut -c1-64)"
-    echo "lines per class: $(grep -v '^#' "$M" | cut -d' ' -f1,2 | sort | uniq -c | awk '{printf "%s/%s=%s ", $2, $3, $1}')"
-    echo "keyed classes, sha256 of each class's lines (differ by construction between key sets): $(for c in $(grep '^keyed ' "$M" | cut -d' ' -f2 | sort -u); do printf '%s=%s ' "$c" "$(grep "^keyed $c " "$M" | sha256sum | cut -c1-12)"; done)"
+    echo "lines per class: $(grep -v '^#' "$M" | cut -d' ' -f1,2 | LC_ALL=C sort | LC_ALL=C uniq -c | awk '{printf "%s/%s=%s ", $2, $3, $1}')"
+    echo "keyed classes, sha256 of each class's lines (differ by construction between key sets): $(for c in $(grep '^keyed ' "$M" | cut -d' ' -f2 | LC_ALL=C sort -u); do printf '%s=%s ' "$c" "$(grep "^keyed $c " "$M" | sha256sum | cut -c1-12)"; done)"
     echo "CI <-> CI: build-manifest.py extract <raw job log> --output A, the same for the second run, build-manifest.py compare A B (exit 0 = stable part equal)"
     echo "NVIDIA kernel modules in /usr: $(grep -c -E '^usr ko .*/nvidia[^/]*\.ko' "$M"); NVIDIA packages installed: $(grep -E '^package deb ' "$M" | awk '$NF ~ /nvidia/ {printf "%s=%s ", $NF, $3}')"
     echo '<details><summary>manifest: input, package, keyed (usr lines in the job log)</summary>'; echo; echo '```'
@@ -511,10 +543,11 @@ exit $rc
 # UKI of release 1), then the channel of 2 3 4 checked offline (tests/ci/release-channel.sh); nothing leaves the job
 step_harness_rel() (
 set +e -uo pipefail
-sudo apt-get install -y -q --no-install-recommends fdisk xz-utils binutils >/dev/null   # sfdisk, xz, objcopy
+if [ "${NL_SHARED_HOST:-0}" = 1 ]; then host_has fdisk xz-utils binutils || exit 1
+else sudo apt-get install -y -q --no-install-recommends fdisk xz-utils binutils >/dev/null; fi   # sfdisk, xz, objcopy
 cd "$TOP"
-keys=/dev/shm/ci-test-keys; cache=$T/apt-cache; R=$T/rel; mkdir -p "$R"; ln -sfn "$T/out" "$R/1"
-X="docker exec -w $PWD o2tools"; rc=0
+keys=$CI_TEST_KEYS; cache=$T/apt-cache; R=$T/rel; mkdir -p "$R"; ln -sfn "$T/out" "$R/1"
+X="docker exec -w $PWD $DK_TOOLS"; rc=0
 for v in 2 3 4; do
   case $v in 2|3) e=1; m=1; p=pcr-e1 ;; 4) e=2; m=4; p=pcr-e2 ;; esac
   x=(); [ $v = 3 ] && x=(--extra-tree tests/overlays/t7-broken-foil-config)
@@ -548,11 +581,11 @@ set -uo pipefail
 [ -e /dev/kvm ] || { echo "no /dev/kvm on this runner"; exit 1; }
 echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm-harness.rules >/dev/null
 sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
-docker rm -f o2tools >/dev/null 2>&1 || true   # the build's tools container; memory for the guest
+docker rm -f "$DK_TOOLS" >/dev/null 2>&1 || true   # the build's tools container; memory for the guest
 mkdir -p "$T/work"; cd "$TOP"
 rc=0
 ENGINE=${ENGINE:-docker} VM_MEM=${VM_MEM:-3G} VM_SMP=${VM_SMP:-2} API_TIMEOUT=${API_TIMEOUT:-600} SETTLE=${SETTLE:-60} \
-STRICT=1 ENROLL=${ENROLL:-auto} IMAGE="$T/out/foilbird-deb_1.raw" FOILCTL="$T/dist/foilctl" KEYS=/dev/shm/ci-test-keys \
+STRICT=1 ENROLL=${ENROLL:-auto} IMAGE="$T/out/foilbird-deb_1.raw" FOILCTL="$T/dist/foilctl" KEYS="$CI_TEST_KEYS" \
   CHANNEL="$T/channel" AGENT_SUMS="$T/dist/SHA256SUMS" WORK="$T/work" make test-container || rc=$?
 f=$T/work/results.txt
 { echo '```'; cat "$f" 2>/dev/null || echo "no results.txt"; echo '```'; } >> "$SUM"
@@ -566,6 +599,39 @@ fi
 v=FAIL; [ $rc = 0 ] && tail -n 1 "$f" | grep -q '^HARNESS PASS ' && tail -n 1 "$f" | grep -q ' 0 skipped' && v=PASS
 echo "HARNESS GATE $v (make test-container rc=$rc, $(tail -n 1 "$f" 2>/dev/null))" | tee -a "$SUM"
 [ $v = PASS ]
+)
+
+# the offline stage (docs/ci-gitlab.md): an online cp build feeding mkosi's package cache, then ci/offline.sh
+# each step one ci/offline.sh call in the step's own process (run_step); its exit code is the step's
+step_offline_bundle() (
+set -eo pipefail
+cd "$TOP"
+ci/offline.sh bundle
+)
+step_offline_probes() (
+set -eo pipefail
+cd "$TOP"
+ci/offline.sh probes
+)
+step_offline_clean() (
+set -eo pipefail
+cd "$TOP"
+ci/offline.sh clean
+)
+step_offline_net() (
+set -eo pipefail
+cd "$TOP"
+ci/offline.sh net
+)
+step_offline_build() (
+set -eo pipefail
+cd "$TOP"
+ci/offline.sh build
+)
+step_offline_compare() (
+set -eo pipefail
+cd "$TOP"
+ci/offline.sh compare
 )
 
 # the agent step's outcome decides the job (the image step does not run without it)
@@ -592,10 +658,31 @@ run_stage() { # run_stage <stage>: the steps of build.yml for that stage, in ord
     lock)      order="preflight tag oss keyfacts lock" ;;
     cp|gpu)    order="preflight tag oss agent disk host snapshot keyfacts image result" ;;
     harness)   order="preflight tag oss agent disk host snapshot keyfacts image harness_rel harness_test result" ;;
-    *) echo "run-stage.sh: unknown stage $1 (gate|selfcheck|lock|cp|gpu|harness)" >&2; return 2 ;;
+    offline)   order="preflight tag oss agent disk host snapshot keyfacts image offline_bundle offline_probes offline_clean offline_net offline_build offline_compare result" ;;
+    *) echo "run-stage.sh: unknown stage $1 (gate|selfcheck|lock|cp|gpu|harness|offline)" >&2; return 2 ;;
   esac
   STAGE=$1; export STAGE
+  dk_clean; trap dk_clean EXIT   # the job's docker names: none left from before, none left after
   [ "$1" = harness ] && { CI_TAG_GLOB=${CI_TAG_GLOB:-harness-try-*}; export CI_TAG_GLOB; }
+  # offline: the online build is cp and fills mkosi's package cache for the bundle
+  if [ "$1" = offline ]; then
+    STAGE=cp; NL_PKGCACHE=$T/pkgcache; mkdir -p "$NL_PKGCACHE"; export STAGE NL_PKGCACHE
+    # the private parts of the job's TEST keys never outlive the stage, whatever step fails (ci/offline.sh clean removes
+    # them on the way; this covers a failure before it)
+    trap 'rm -rf "$T/bkey" "$T/probes"; dk_clean' EXIT
+    # shared host: the agent's tools set at its one absolute path (/opt/foilbird-build-tools/...) is the host's; the stage
+    # builds its own there (online) and its clean removes it, as on a fresh runner. The host's set waits beside it and
+    # comes back on the way out, whatever step fails; the stage's own set (online or offline built) goes
+    if [ "${NL_SHARED_HOST:-0}" = 1 ]; then
+      TS=$(cd "$TOP/agent" && ./build-release.sh --print-tools-root) || { echo "run-stage.sh: --print-tools-root failed" >&2; return 1; }
+      case $TS in /opt/foilbird-build-tools/?*) ;; *) echo "run-stage.sh: tools set $TS not under /opt/foilbird-build-tools" >&2; return 1 ;; esac
+      TSA=$TS.host-aside
+      [ ! -e "$TSA" ] || { echo "run-stage.sh: $TSA is there (a stage before did not put it back): put it back by hand" >&2; return 1; }
+      [ ! -e "$TS" ] || mv -- "$TS" "$TSA" || { echo "run-stage.sh: could not put $TS aside" >&2; return 1; }
+      echo "shared host: the host's agent tools set $([ -e "$TSA" ] && echo "put aside ($TSA)" || echo "absent")"
+      trap 'rm -rf "$T/bkey" "$T/probes"; rm -rf --one-file-system -- "$TS"; [ ! -e "$TSA" ] || { mv -- "$TSA" "$TS" && echo "shared host: the host'"'"'s agent tools set put back ($TS)"; }; dk_clean' EXIT
+    fi
+  fi
   for s in $order; do
     echo "===== run-stage $1: $s"
     case $s in image|harness_rel|harness_test) [ "$(cat "$T/agent.outcome" 2>/dev/null)" != success ] && { echo "$s: skipped (agent step failed)"; continue; } ;; esac
@@ -611,6 +698,6 @@ case ${1:-} in
   __step) n=${2:?step name}; declare -F "step_$n" >/dev/null || { echo "run-stage.sh: unknown step $n" >&2; exit 2; }; "step_$n"; exit $? ;;
   # tests/ci/run-stage-errexit.sh only: one checked helper of the image step on its own (no build)
   __fn) case ${2:-} in nvidia_offline|provenance_summary) f=$2; shift 2; "$f" "$@"; exit $? ;; *) echo "run-stage.sh: __fn nvidia_offline|provenance_summary" >&2; exit 2 ;; esac ;;
-  gate|selfcheck|lock|cp|gpu|harness) run_stage "$1" ;;
+  gate|selfcheck|lock|cp|gpu|harness|offline) run_stage "$1" ;;
   *) awk 'NR > 1 && !/^#/ {exit} NR > 1' "$0"; exit 2 ;;
 esac

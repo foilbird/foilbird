@@ -235,6 +235,8 @@ def main():
     cache = os.path.abspath(o.cache)
     log = Log()
     try:
+        if o.command == "fetch" and os.environ.get("NL_OFFLINE") == "1":
+            raise SystemExit("fetch refused: NL_OFFLINE=1 (offline build: verify and prepare from the cache only)")
         if o.command == "fetch":
             fetch(cache, log)
             (_, sets, lock), = ap.load_conf([CONF])

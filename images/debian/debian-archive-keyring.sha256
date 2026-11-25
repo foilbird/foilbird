@@ -1,0 +1,5 @@
+# The trust anchor of the snapshot.debian.org lists in an input bundle (ci/bundle-apt-verify.py): the Debian archive
+# keyring .deb of the snapshot below, by its sha256 (its stanza in the snapshot's trixie main Packages). A new Snapshot=
+# needs a new pin: the verify refuses a snapshot this file does not name. Not read by mkosi.
+snapshot 20261120T000000Z
+sha256 9ea7778e443144ca490668737a8ab22dd3e748bb99e805e22ec055abeb3c7fac debian-archive-keyring_2025.1_all.deb

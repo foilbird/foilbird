@@ -662,6 +662,8 @@ def main():
             for c, sets, lock in confs:
                 write_lock(c, sets, lock, cache)
             return
+        if o.command == "fetch" and os.environ.get("NL_OFFLINE") == "1":
+            raise SystemExit("fetch refused: NL_OFFLINE=1 (offline build: verify and prepare from the cache only)")
         if o.command == "fetch":
             for _, sets, _ in confs:
                 for s in sets:

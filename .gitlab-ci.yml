@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: Apache-2.0
+# GitLab CI for a closed network (docs/ci-gitlab.md): the same build as GitHub Actions, through the same script. Every
+# job only calls ci/run-stage.sh; nothing of the build is written here. The runner (tag from NL_RUNNER_TAG) is set up as
+# docs/ci-gitlab.md says; an offline build takes the input bundle (NL_BUNDLE) checked against NL_BUNDLE_FPR and
+# NL_BUNDLE_KEYRING (protected variables of the project; the private key never comes here).
+stages: [lock, cp, gpu, harness, offline]
+
+# no runner tag, no pipeline: GitLab reports it as filtered out by the workflow rules, never a job pending for a runner
+# with an empty tag
+workflow:
+  rules:
+    - if: $NL_RUNNER_TAG == null || $NL_RUNNER_TAG == ""
+      when: never
+    - when: always
+
+variables:
+  CI_TAG_GLOB: "build-try-*"
+  NL_OFFLINE: "0"
+  # a GitLab runner is a host that outlives the job: the job changes nothing of it outside CI_TMP (ci/run-stage.sh)
+  NL_SHARED_HOST: "1"
+  # the job's docker containers and image carry its id (ci/run-stage.sh); NL_DOCKER_CPUS (a runner or project variable)
+  # caps each container, docker's cgroup being outside the runner's own limits
+  NL_DOCKER_TAG: "$CI_JOB_ID"
+
+.stage:
+  tags: ["$NL_RUNNER_TAG"]
+  # a run from the web, or a tag of the CI-try pattern (CI_TAG_GLOB); any other tag and every push start nothing
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_TAG =~ /^build-try-[0-9]+(-[a-z0-9]+)?$/
+  timeout: 6h
+  # the job's work directory: only $CI_BUILDS_DIR/tmp/<job id>, removed on the way out (EXIT trap) and checked after
+  script:
+    - T="$CI_BUILDS_DIR/tmp/$CI_JOB_ID"; case "$CI_BUILDS_DIR:$CI_JOB_ID" in /?*:[0-9]*) ;; *) echo "CI_TMP refused - $T"; exit 1 ;; esac; trap 'rm -rf --one-file-system -- "$T"' EXIT; CI_TMP="$T" CI_SUMMARY="$CI_PROJECT_DIR/summary.md" ci/run-stage.sh "$CI_JOB_STAGE"
+  after_script:
+    - cat "$CI_PROJECT_DIR/summary.md" 2>/dev/null || true
+    - T="$CI_BUILDS_DIR/tmp/$CI_JOB_ID"; [ ! -e "$T" ] || { echo "CI_TMP still there after the job - removing $T"; rm -rf --one-file-system -- "$T"; }
+
+# manual: `when` inside each rule, never at the job level beside `rules`; allow_failure keeps the later stages running
+# while lock waits, as a job-level manual job would
+lock:
+  extends: .stage
+  stage: lock
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+      allow_failure: true
+    - if: $CI_COMMIT_TAG =~ /^build-try-[0-9]+(-[a-z0-9]+)?$/
+      when: manual
+      allow_failure: true
+
+cp:
+  extends: .stage
+  stage: cp
+
+gpu:
+  extends: .stage
+  stage: gpu
+
+# the harness gate (ci/run-stage.sh harness: releases 1-4 built in the job, make test STRICT=1; the runner needs /dev/kvm):
+# manual, from the web or on a tag of the harness-try pattern (run-stage.sh sets CI_TAG_GLOB=harness-try-* for it)
+harness:
+  extends: .stage
+  stage: harness
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+      allow_failure: true
+    - if: $CI_COMMIT_TAG =~ /^harness-try-[0-9]+(-[a-z0-9]+)?$/
+      when: manual
+      allow_failure: true
+
+# the offline stage (ci/run-stage.sh offline, as .github/workflows/offline.yml): an online cp build, the input bundle and
+# its refusal probes, the network cut for the build only, cp again from the bundle alone, the two manifests compared.
+# Manual, from the web or on a tag of the offline-try pattern; the commit must carry an offline-try-* tag (CI_TAG_GLOB);
+# the agent is built offline from its inputs in the bundle, no interim dist from the online build
+offline:
+  extends: .stage
+  stage: offline
+  variables:
+    CI_TAG_GLOB: "offline-try-*"
+    NL_OFFLINE_AGENT_REQUIRED: "1"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+      allow_failure: true
+    - if: $CI_COMMIT_TAG =~ /^offline-try-[0-9]+(-[a-z0-9]+)?$/
+      when: manual
+      allow_failure: true

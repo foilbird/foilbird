@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+# The offline build (docs/ci-gitlab.md) - an online cp build, the input bundle and its refusal probes, the network
+# cut for the build only (a network namespace: the runner keeps its own connection), cp again from the bundle alone,
+# the two manifests compared. Only on a push to a ci/offline-try-* branch, for a commit with an offline-try-* tag. Everything is in
+# ci/run-stage.sh offline (ci/offline.sh): this file only fetches the commit and maps the GitHub variables. No upload,
+# no cache between jobs, no secrets, no third-party actions; only manifests and the summary go into the log.
+name: offline
+
+on:
+  push:
+    branches: [ "ci/offline-try-*" ]
+
+permissions:
+  contents: read
+
+env:
+  CI_TAG_GLOB: "offline-try-*"
+  # the counted run: the agent is built offline from its inputs in the bundle (agent/tools/offline-inputs.sh); without
+  # them the stage fails (ci/offline.sh), no interim dist from the online build
+  NL_OFFLINE_AGENT_REQUIRED: "1"
+  CI_LOG_GROUPS: github
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  offline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 160
+    steps:
+      - name: Source (this commit and its offline-try tag)
+        timeout-minutes: 5
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q src && cd src
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY"
+          auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
+          git -c http.extraHeader="AUTHORIZATION: basic $auth" fetch -q --depth 1 origin "$GITHUB_SHA"
+          git -c http.extraHeader="AUTHORIZATION: basic $auth" fetch -q --depth 1 origin '+refs/tags/offline-try-*:refs/tags/offline-try-*' || true
+          git checkout -q "$GITHUB_SHA"
+
+      - name: Offline stage (online cp, bundle, probes, network cut, offline cp, compare)
+        timeout-minutes: 150
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          CI_GIT_AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)" CI_OWN=$GITHUB_REPOSITORY \
+            CI_TMP=$RUNNER_TEMP CI_SUMMARY=$GITHUB_STEP_SUMMARY src/ci/run-stage.sh offline

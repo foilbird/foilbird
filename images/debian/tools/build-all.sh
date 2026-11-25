@@ -7,6 +7,10 @@
 #   build-all.sh --version <N> --variant <cp|gpu> --keys <dir> --agent-dist <dir> --cache <dir> --output-dir <dir>
 #                --epoch <E> --min-version <M> [--profile <dir>] [--channel <url|/path>] [--channel-ca <pem>]
 #                [--release-epochs <E:F,...>] [--lab] [--pcr <name>] [--extra-tree <dir>] [--image-only]
+#                [--check-inputs]
+#
+#   --check-inputs every check of the inputs (options, keys, agent dist, SOURCE_DATE_EPOCH, with NL_OFFLINE=1 the bundle
+#                  verify), then exit 0 before the first step: nothing staged, no root entry, no mkosi
 #
 #   --variant      cp   no NVIDIA package installed: every NVIDIA set of the set files (nvidia_sets below: nvidia-driver,
 #                       nvidia-container-toolkit) is verified in full and installs nothing (apt-pin.py prepare
@@ -33,9 +37,15 @@
 #                  Debian 13 container that sees the tree and the cache at the same paths (`docker exec -w <tree> NAME`);
 #                  empty = the host (a Debian 13 build host)
 #   SOURCE_DATE_EPOCH  default: commit time of the tree
+#   NL_PKGCACHE    mkosi's package cache directory (absolute; tools/mkosi-offline.sh), filled online, carried in the bundle
+#   NL_OFFLINE     1: no network (mkosi cache-only; apt-pin.py and fetch-upstream.py refuse fetch); docs/ci-gitlab.md.
+#                  Starts only from a verified bundle: NL_BUNDLE (ci/bundle.sh verify with NL_BUNDLE_FPR, NL_BUNDLE_KEYRING)
+#                  before the first step, NL_PKGCACHE = <bundle>/pkgcache, --cache = <bundle>/apt-cache; a refusal stops
+#                  the build before any root entry or mkosi
 #   NL_BUILD       a build host's root wrapper (/usr/local/sbin/nl-build, the only command its user may sudo): the three
 #                  mkosi entries go through `sudo -n $NL_BUILD --tree <tree> --sde <epoch> initrd|recovery|image ...`,
-#                  which fixes the environment and mkosi itself. Unset (CI): `sudo env PATH=... SOURCE_DATE_EPOCH=...`
+#                  which fixes the environment and mkosi itself; NL_PKGCACHE / NL_OFFLINE go as its --pkgcache / --offline.
+#                  Unset (CI): `sudo env PATH=... SOURCE_DATE_EPOCH=... NL_PKGCACHE=... NL_OFFLINE=...`
 #
 # Steps: agent staged -> apt-pin.py prepare (both set files) -> fetch-upstream.py prepare (profile k8s-worker) ->
 # foilbird-initrd/build.sh -> recovery/build.sh -> build-image.sh --include mkosi/pinned.conf (lab-gate inside) -> manifest.
@@ -46,7 +56,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd); top=$(cd "$here/../.." && pwd)
 die() { echo "build-all.sh: $*" >&2; exit 2; }
 step() { echo "== build-all: $*"; }
-profile=; version=; variant=; keys=; dist=; cache=; out=; epoch=; minv=; pass=(); pcr=pcr-e1; xtree=; imgonly=0
+profile=; version=; variant=; keys=; dist=; cache=; out=; epoch=; minv=; pass=(); pcr=pcr-e1; xtree=; imgonly=0; checkonly=0
 while [ $# -gt 0 ]; do
   case $1 in
     --profile) profile=$(cd "${2:?}" && pwd); shift 2 ;;
@@ -63,6 +73,7 @@ while [ $# -gt 0 ]; do
     --pcr) pcr=${2:?}; shift 2 ;;
     --extra-tree) xtree=$(cd "${2:?}" && pwd); shift 2 ;;
     --image-only) imgonly=1; shift ;;
+    --check-inputs) checkonly=1; shift ;;
     *) die "unknown option $1 (see the header of this script)" ;;
   esac
 done
@@ -77,6 +88,33 @@ if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then SOURCE_DATE_EPOCH=$(git -C "$top" log -
 case $SOURCE_DATE_EPOCH in ''|*[!0-9]*) die "SOURCE_DATE_EPOCH must be a number";; esac
 export SOURCE_DATE_EPOCH
 read -r -a tx <<< "${TOOLS_EXEC:-}"
+
+# an offline build starts only from a verified bundle, checked here before the first step (no root entry, no mkosi yet):
+# its signature and every file (ci/bundle.sh verify), and the package caches are the bundle's own
+if [ "${NL_OFFLINE:-0}" = 1 ]; then
+  [ -n "${NL_BUNDLE:-}" ] && [ -d "$NL_BUNDLE" ] || die "NL_OFFLINE=1 needs NL_BUNDLE (the input bundle)"
+  bdir=$(cd "$NL_BUNDLE" && pwd -P)
+  [ -n "${NL_PKGCACHE:-}" ] && [ "$(cd "$NL_PKGCACHE" 2>/dev/null && pwd -P)" = "$bdir/pkgcache" ] ||
+    die "NL_OFFLINE=1: NL_PKGCACHE must be the bundle's $bdir/pkgcache (got ${NL_PKGCACHE:-unset})"
+  [ "$(cd "$cache" && pwd -P)" = "$bdir/apt-cache" ] || die "NL_OFFLINE=1: --cache must be the bundle's $bdir/apt-cache (got $cache)"
+  "$top/ci/bundle.sh" verify "$bdir" --tree "$top" || die "bundle refused: no offline build"
+  # the tools tree of an offline build is the bundle's, restored into every build directory before (ci/offline.sh, or
+  # nl-build restore-tools on a build host): an offline build never builds one (it would have no repository metadata)
+  want=$(sha256sum < "$bdir/tools/mkosi.tools.manifest" | cut -c1-64)
+  for d in "$here/foilbird-initrd" "$here/recovery" "${profile:-$here/mkosi}"; do
+    [ -d "$d/mkosi.tools" ] && [ -f "$d/mkosi.tools.manifest" ] ||
+      die "NL_OFFLINE=1: no restored tools tree in $d (restore the bundle's tools/mkosi.tools.tar first; an offline build never builds one)"
+    [ "$(sha256sum < "$d/mkosi.tools.manifest" | cut -c1-64)" = "$want" ] || die "NL_OFFLINE=1: the tools tree in $d is not the bundle's (mkosi.tools.manifest)"
+  done
+  # the apt chain of the bundle against the tree: InRelease -> Packages -> .deb (ci/bundle-apt-verify.py); sqv of the
+  # pinned tools (TOOLS_EXEC: the Debian 13 container of the snapshot) or else of the restored tools tree, never the host's
+  if [ ${#tx[@]} -gt 0 ]; then sqv=(sqv)
+  else tt=${profile:-$here/mkosi}/mkosi.tools; sqv=("$tt/usr/lib64/ld-linux-x86-64.so.2" --library-path "$tt/usr/lib/x86_64-linux-gnu" "$tt/usr/bin/sqv"); fi
+  "${tx[@]}" python3 "$top/ci/bundle-apt-verify.py" --bundle "$bdir" --tree "$top" -- "${sqv[@]}" || die "bundle refused: the apt chain (bundle-apt-verify.py)"
+fi
+if [ "$checkonly" = 1 ]; then
+  echo "build-all: inputs checked$([ "${NL_OFFLINE:-0}" = 1 ] && echo ', bundle verified'), no step run (--check-inputs)"; exit 0
+fi
 
 # modes of the tree as git records them, whatever umask the checkout ran with: mkosi copies the modes of the extra trees
 # into /usr, and git keeps only the executable bit, so a checkout under umask 0002 gave 0664 files and 0775 directories in
@@ -117,12 +155,19 @@ PY
 # root for the mkosi entries only, with an explicit environment: entry <initrd|recovery|image> [build-image.sh options]
 entry() {
   local e=$1; shift
-  if [ -n "${NL_BUILD:-}" ]; then sudo -n "$NL_BUILD" --tree "$top" --sde "$SOURCE_DATE_EPOCH" "$e" "$@"; return; fi
+  if [ -n "${NL_BUILD:-}" ]; then
+    # the build host wrapper takes no environment: the offline inputs go as its options (it checks the path itself)
+    local o=()
+    [ -z "${NL_PKGCACHE:-}" ] || o+=(--pkgcache "$NL_PKGCACHE")
+    [ "${NL_OFFLINE:-0}" = 0 ] || o+=(--offline)
+    sudo -n "$NL_BUILD" --tree "$top" --sde "$SOURCE_DATE_EPOCH" "${o[@]}" "$e" "$@"; return; fi
   local cmd
   case $e in initrd) cd "$here/foilbird-initrd"; cmd=(./build.sh) ;; recovery) cd "$here/recovery"; cmd=(./build.sh) ;;
              image) cmd=("$here/build-image.sh") ;; esac
-  if [ "$(id -u)" = 0 ]; then env PATH="$PATH" SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" "${cmd[@]}" "$@"
-  else sudo env PATH="$PATH" SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" "${cmd[@]}" "$@"; fi
+  # the explicit environment of the root entries: the offline inputs too (docs/ci-gitlab.md), never sudo -E
+  local envl=(PATH="$PATH" SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" NL_PKGCACHE="${NL_PKGCACHE:-}" NL_OFFLINE="${NL_OFFLINE:-0}")
+  if [ "$(id -u)" = 0 ]; then env "${envl[@]}" "${cmd[@]}" "$@"
+  else sudo env "${envl[@]}" "${cmd[@]}" "$@"; fi
 }
 
 confs=(--conf "$here/apt-pin.conf"); locks=(--input "images/debian/apt-pin.lock=$here/apt-pin.lock")
