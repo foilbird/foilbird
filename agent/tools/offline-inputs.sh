@@ -44,16 +44,23 @@ TARBALLS="rust-$RUST_VERSION-x86_64-unknown-linux-gnu.tar.xz rust-std-$RUST_VERS
 TOOLS="cargo-auditable:$AUD cargo-cyclonedx:$CDX"
 
 gpgcheck() { # gpgcheck <dir>: the key file has exactly the pinned primary key; every .asc verifies with it
-  local d=$1 g; g=$(mktemp -d)
-  local fprs; fprs=$(gpg --homedir "$g" --batch --with-colons --show-keys "$d/rust/rust-key.gpg.ascii" 2>/dev/null | awk -F: '$1=="pub"{p=1;next} p&&$1=="fpr"{print $10; p=0}')
-  [ "$fprs" = "$RUST_KEY_FPR" ] || { rm -rf "$g"; die "rust-key.gpg.ascii: primary key [$fprs], pinned $RUST_KEY_FPR"; }
-  gpg --homedir "$g" --batch -q --import "$d/rust/rust-key.gpg.ascii" 2>/dev/null
+  # gpg's stderr goes to a file and into the message of a failure, never to /dev/null: under set -e a failing gpg ended
+  # the script without a line (G8 alpha3 job 18: --import without gpg-agent, rc 2). gpg needs gpg-agent for --import
+  # (Debian: package gpg-agent, only a Recommends of gpg); no dirmngr, no pinentry.
+  local d=$1 g e out st; g=$(mktemp -d)
+  gerr() { e=$(grep -v '^[[:space:]]*$' "$g.err" 2>/dev/null | tail -n 3 | paste -sd' ' || true); rm -rf "$g" "$g.err"; die "$1 ($(gpg --version 2>/dev/null | sed -n 1p), gpg-agent $(command -v gpg-agent || echo 'not installed')): ${e:-no message}"; }
+  out=$(gpg --homedir "$g" --batch --with-colons --show-keys "$d/rust/rust-key.gpg.ascii" 2> "$g.err") || gerr "gpg --show-keys rust-key.gpg.ascii failed"
+  local fprs; fprs=$(awk -F: '$1=="pub"{p=1;next} p&&$1=="fpr"{print $10; p=0}' <<< "$out")
+  [ "$fprs" = "$RUST_KEY_FPR" ] || { rm -rf "$g" "$g.err"; die "rust-key.gpg.ascii: primary key [$fprs], pinned $RUST_KEY_FPR"; }
+  gpg --homedir "$g" --batch -q --import "$d/rust/rust-key.gpg.ascii" 2> "$g.err" || gerr "gpg --import rust-key.gpg.ascii failed"
   local t; for t in $TARBALLS; do
-    gpg --homedir "$g" --batch --status-fd 1 --verify "$d/rust/$t.asc" "$d/rust/$t" 2>/dev/null | grep -q "^\[GNUPG:\] VALIDSIG .* $RUST_KEY_FPR\$" ||
-      { rm -rf "$g"; die "$t: no valid signature of $RUST_KEY_FPR"; }
-    (cd "$d/rust" && sha256sum -c --quiet "$t.sha256") || { rm -rf "$g"; die "$t: sha256 differs from $t.sha256"; }
+    # the status lines into a variable, then grep: no `gpg | grep -q` under pipefail (grep -q stops at the match, gpg may
+    # then get SIGPIPE and the pipeline fails although the signature is valid)
+    st=$(gpg --homedir "$g" --batch --status-fd 1 --verify "$d/rust/$t.asc" "$d/rust/$t" 2> "$g.err") || true
+    grep -q "^\[GNUPG:\] VALIDSIG .* $RUST_KEY_FPR\$" <<< "$st" || gerr "$t: no valid signature of $RUST_KEY_FPR"
+    (cd "$d/rust" && sha256sum -c --quiet "$t.sha256") || { rm -rf "$g" "$g.err"; die "$t: sha256 differs from $t.sha256"; }
   done
-  rm -rf "$g"
+  rm -rf "$g" "$g.err"
 }
 
 cratecheck() { # cratecheck <dir>: every tool .crate = the sha256 recorded from the crates.io index at fetch

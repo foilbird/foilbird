@@ -6,7 +6,10 @@
 # the agent always reports a boot confirmation result.
 [Unit]
 Description=Health gate before boot-complete (foilbird)
-After=foil-config.service foil-agent.service dbus.socket
+# foil-repart: on the first boot the check (and its reboot on failure) waits for the repartitioning, whatever happened to
+# the units that need /var meanwhile; a reboot in the middle stopped foil-repart before it wrote the partition table and
+# the next boot started over (Proxmox HDD, 2026-11-27). foil-repart is skipped on every later boot (/var exists): no wait.
+After=foil-config.service foil-agent.service dbus.socket foil-repart.service
 Before=boot-complete.target
 
 [Service]

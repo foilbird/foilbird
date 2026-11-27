@@ -3,15 +3,35 @@
 """Build manifest of one image build (docs/reproducible-build.md): a sorted text file that two builds of the same
 commit and snapshot can be compared by, line by line, even when they were signed with different keys.
 
-  build-manifest.py make --out-dir DIR [--usr-image FILE | --usr-tree DIR] [--input NAME=FILE]... [--output FILE]
+  build-manifest.py make --out-dir DIR [--usr-image FILE | --usr-tree DIR] [--input NAME=FILE]... [--param NAME=VALUE]...
+                         [--apt-inputs FILE] [--output FILE]
       DIR       the build-image.sh output directory (build-params.txt, the mkosi JSON package manifest *.manifest,
                 the partition images and the UKI); the /usr image is found there unless --usr-image/--usr-tree is given
       --input   a build input whose sha256 is recorded (apt-pin.lock, apt-pin-inputs.json, the agent dist SHA256SUMS,
                 upstream.json, ...); NAME is the label in the manifest
+      --param   a build input recorded by its value (an `input param` line, compared strictly): the C toolchain of the
+                agent dist (agent-toolchain:<package>=<version>, from the dist's C-TOOLCHAIN); NAME without spaces
+      --apt-inputs  apt-pin-inputs.json (apt-pin.py prepare): the third-party repositories are not snapshots, their
+                InRelease is re-signed upstream (NVIDIA every few days) and a run that fetches it on another day reads
+                another one. Recorded in two parts: `input file <sha256> apt-pin-inputs.json:stable`, the file without
+                the fields of the fetched InRelease and index (FETCH_FIELDS), compared strictly (keys, origin, label,
+                every .deb, the lock); and one `keyed inrelease <value> <set>:<field>` line per such field, an expected
+                difference when both builds have it, and only for the three repositories of INRELEASE_SETS (another set
+                keeps these fields in the strict part). One `input param <check> apt-pin-chain:<set>` line per set: the
+                chain check of apt-pin.py (signature by the pinned key, index = InRelease, every file = index = lock); a
+                set without it refuses the make. Every pinned .deb the image installs (role install of a set not in
+                source_only): `input pinned-deb <sha256> <size> <set>:<package>=<version>`, and one line
+                `input param ok apt-pin-installed`: each of them is in the mkosi package manifest with that version, no
+                package of a source-only set is (else the make is refused). The whole file is never an expected difference
   build-manifest.py extract LOG [--output FILE]
       the manifest a CI job printed between "=== BEGIN build-manifest.txt" and "=== END build-manifest.txt", from
       its raw log (`gh run view --log`: "<job>\t<step>\t<timestamp> <line>") or a plain log; CI <-> CI comparison
       of two runs of one tag = extract both, then compare
+      --block apt-pin-inputs.json: the apt-pin-inputs.json the job printed the same way (the full provenance of the
+      third-party sets: every InRelease, index and .deb), for the evidence of a run
+  build-manifest.py apt-inputs FILE
+      the manifest lines of an apt-pin-inputs.json (as make --apt-inputs writes them): an extracted file is checked against
+      the `apt-pin-inputs.json:stable`, `apt-pin-chain`, `pinned-deb` and `keyed inrelease` lines of its run's manifest
   build-manifest.py compare A B
       exit 0 if A and B agree on every line of a stable class and differ at most in the classes that depend on keys or
       deployment parameters (each such difference is printed with its reason); exit 1 otherwise, listing what differs
@@ -23,8 +43,11 @@ commit and snapshot can be compared by, line by line, even when they were signed
       keyed artifacts and files are printed for reference. A v1 manifest has no sizes: printed, not compared.
 
 Lines (`<section> <class> <value...> <name>`; sorted):
-  input    param   <value> <name>          build-params.txt: debian_snapshot, source_date_epoch, seed, mkosi, version, ...
+  input    param   <value> <name>          build-params.txt: debian_snapshot, source_date_epoch, seed, mkosi, version, ...;
+                                           every --param (agent-toolchain:<package>)
   input    file    <sha256> <name>         every --input file
+  input    pinned-deb <sha256> <size> <set>:<package>=<version>
+                                           a third-party .deb the image installs, as the lock pins it (--apt-inputs)
   package  deb     <version> <arch> <name> the mkosi package manifest (what apt installed, with versions)
   usr      file    <sha256> <mode> <path>  every regular file of /usr (content and permission bits)
   usr      link    <target> <path>         every symlink
@@ -37,6 +60,7 @@ Lines (`<section> <class> <value...> <name>`; sorted):
                                            size in bytes (v2)
   keyed    ko-signed <sha256> <path>       a signed module as shipped
   keyed    build-param <value> <name>      key fingerprints and the channel of build-params.txt
+  keyed    inrelease <value> <set>:<field> a field of a third-party InRelease fetched (FETCH_FIELDS; --apt-inputs)
 Ownership is not recorded (an unprivileged extraction of the erofs image cannot read it).
 """
 import argparse
@@ -72,6 +96,16 @@ KEYED = [
 ARTIFACT = re.compile(r"^[a-z0-9-]+_[0-9]+(\.efi|\.raw|\.esp\.raw|\.usr-x86-64\.raw|\.usr-x86-64-verity\.raw|\.usr-x86-64-verity-sig\.raw)$")
 BUILD_PARAMS = {"release_key", "sb_cert_sha256", "pcr_cert_sha256", "channel", "channel_ca"}
 KO = re.compile(r"\.ko(\.xz|\.zst|\.gz)?$")
+# the fields of apt-pin-inputs.json that come from the InRelease and the index as fetched (a third-party repository
+# re-signs its InRelease: another day, another InRelease and index; the .debs are pinned by the lock): (section, keys)
+FETCH_FIELDS = (("inrelease", ("sha256", "date", "valid_until")), ("index", ("sha256", "sha512", "size")),
+                ("packages_gz", ("sha256", "sha512", "size")))
+# the only sets whose fetched InRelease fields are keyed: set name -> repository (apt-pin.py TRUSTED). A new set or a new
+# field is not here: its lines stay strict (make) or are refused as keyed (compare)
+INRELEASE_SETS = {"nvidia-driver": "https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64",
+                  "nvidia-container-toolkit": "https://nvidia.github.io/libnvidia-container/stable/deb/amd64",
+                  "k8s": "https://pkgs.k8s.io/core:/stable:/v1.34/deb"}
+INRELEASE = {"%s:%s.%s" % (s, sec, k) for s in INRELEASE_SETS for sec, keys in FETCH_FIELDS for k in keys}
 # keyed artifacts whose SIZE must be equal between two builds of one commit: the verity hash tree (its size follows from the
 # size of /usr) and the disk image (its size is the repart layout); the other sizes are for reference
 SIZE_STRICT = re.compile(r"(\.usr-x86-64-verity\.raw|^[a-z0-9-]+_[0-9]+\.raw)$")
@@ -166,6 +200,38 @@ def extract_usr(image, dest):
         raise SystemExit("build-manifest: fsck.erofs %s: rc=%d %s" % (image, r.returncode, r.stderr.strip()[-300:]))
 
 
+def apt_inputs_lines(d):
+    """The manifest lines of apt-pin-inputs.json (make --apt-inputs; `apt-inputs FILE` prints them for a file taken from a
+    job log): ([lines], [(set, package, version) installed from the lock], [(set, package) of source-only sets])."""
+    out, pinned, unpinned = [], [], []
+    so = set(d.get("source_only", []))
+    for s in d.get("sets", []):
+        if not str(s.get("chain_check", "")).startswith("ok:"):
+            raise SystemExit("build-manifest: --apt-inputs: set %s has no passed chain check (apt-pin.py prepare with the lock)" % s.get("set"))
+        out.append("input param ok apt-pin-chain:%s" % s["set"])
+        for e in s.get("files", []):
+            if e.get("role") != "install":
+                continue
+            if s["set"] in so:
+                unpinned.append((s["set"], e["package"]))
+            else:
+                pinned.append((s["set"], e["package"], e["version"]))
+                out.append("input pinned-deb %s %d %s:%s=%s" % (e["sha256"], e["size"], s["set"], e["package"], e["version"]))
+        if INRELEASE_SETS.get(s.get("set")) != s.get("repository"):
+            continue   # not one of the three: every field strict
+        for sec, keys in FETCH_FIELDS:
+            part = s.get(sec)
+            if not isinstance(part, dict):
+                continue
+            for k in keys:
+                if k in part:
+                    v = part.pop(k)
+                    out.append("keyed inrelease %s %s:%s.%s" % ("none" if v is None else v, s["set"], sec, k))
+    stable = json.dumps(d, sort_keys=True, separators=(",", ":")).encode()
+    out.append("input file %s apt-pin-inputs.json:stable" % sha256(stable))
+    return out, pinned, unpinned
+
+
 def make(o):
     out = []
     bp = os.path.join(o.out_dir, "build-params.txt")
@@ -188,13 +254,32 @@ def make(o):
         if not path or not os.path.isfile(path):
             raise SystemExit("build-manifest: --input %s: expected NAME=FILE" % spec)
         out.append("input file %s %s" % (sha256_file(path), name))
+    pinned, unpinned = [], []
+    if o.apt_inputs:
+        lines, pinned, unpinned = apt_inputs_lines(json.load(open(o.apt_inputs)))
+        out += lines
+    for spec in o.param or []:
+        name, _, value = spec.partition("=")
+        if not name or not value or re.search(r"\s", name) or "\n" in value:
+            raise SystemExit("build-manifest: --param %s: expected NAME=VALUE (NAME without spaces)" % spec)
+        out.append("input param %s %s" % (value, name))
     mans = sorted(glob.glob(os.path.join(o.out_dir, "*.manifest")))
     if not mans:
         raise SystemExit("build-manifest: no mkosi package manifest (*.manifest, ManifestFormat=json) in %s" % o.out_dir)
+    have = {}
     for m in mans:
         for p in json.load(open(m)).get("packages", []):
             out.append("package %s %s %s %s" % (p.get("type", "deb"), p["version"], p.get("architecture", "-"), p["name"]))
+            have.setdefault(p["name"], set()).add(p["version"])
         out.append("input file %s manifest:%s" % (sha256_file(m), os.path.basename(m)))
+    if o.apt_inputs:
+        # installed = lock: every pinned .deb of an installed set is in the package manifest at its version; nothing of a
+        # source-only set is installed
+        probs = ["%s:%s=%s not installed (%s)" % (st, n, v, ", ".join(sorted(have.get(n, ()))) or "absent") for st, n, v in pinned if v not in have.get(n, ())]
+        probs += ["%s:%s installed from a source-only set (%s)" % (st, n, ", ".join(sorted(have[n]))) for st, n in unpinned if n in have]
+        if probs:
+            raise SystemExit("build-manifest: installed != lock: %s" % "; ".join(probs))
+        out.append("input param ok apt-pin-installed")
     for f in sorted(os.listdir(o.out_dir)):
         p = os.path.join(o.out_dir, f)
         if os.path.isfile(p) and not os.path.islink(p) and (f.endswith(".raw") or f.endswith(".efi")):
@@ -222,16 +307,16 @@ def extract(o):
     out, inside, found = [], False, False
     for raw in open(o.log, encoding="utf-8", errors="replace"):
         line = GH_PREFIX.sub("", raw.rstrip("\n").replace("\ufeff", ""))
-        if line == "=== BEGIN build-manifest.txt":
+        if line == "=== BEGIN %s" % o.block:
             out, inside, found = [], True, True   # the last printed manifest wins
             continue
-        if line == "=== END build-manifest.txt":
+        if line == "=== END %s" % o.block:
             inside = False
             continue
         if inside:
             out.append(line)
     if not found or inside:
-        raise SystemExit("build-manifest: %s: no complete BEGIN/END build-manifest.txt block" % o.log)
+        raise SystemExit("build-manifest: %s: no complete BEGIN/END %s block" % (o.log, o.block))
     text = "\n".join(out) + "\n"
     if o.output:
         open(o.output, "w").write(text)
@@ -265,6 +350,9 @@ def keyed_open(M):
         elif c == "build-param":
             if name not in BUILD_PARAMS:
                 out.append("keyed build-param %s: not in BUILD_PARAMS" % name)
+        elif c == "inrelease":
+            if name not in INRELEASE:
+                out.append("keyed inrelease %s: not a field of FETCH_FIELDS of a set of INRELEASE_SETS" % name)
         else:
             kc, _ = keyed_class(name)
             if kc is None:
@@ -284,7 +372,7 @@ def sized(M, k):
 
 
 def closed_list_digest():
-    text = repr((KEYED, ARTIFACT.pattern, sorted(BUILD_PARAMS), KO.pattern))
+    text = repr((KEYED, ARTIFACT.pattern, sorted(BUILD_PARAMS), KO.pattern, sorted(INRELEASE_SETS.items()), FETCH_FIELDS))
     return hashlib.sha256(text.encode()).hexdigest()
 
 
@@ -302,14 +390,15 @@ def compare(a, b):
             if sec == "keyed":
                 per[c] = per.get(c, 0) + 1
         print("keyed lines %s: %d (%s)" % (tag, sum(per.values()), ", ".join("%s %d" % kv for kv in sorted(per.items()))))
-    print("closed keyed list: sha256 %s (KEYED + ARTIFACT + BUILD_PARAMS of this build-manifest.py)" % closed_list_digest())
+    print("closed keyed list: sha256 %s (KEYED + ARTIFACT + BUILD_PARAMS + INRELEASE_SETS/FETCH_FIELDS of this build-manifest.py)" % closed_list_digest())
     for k in sorted(k for k in set(A) | set(B) if k[0] == "keyed" and k[1] not in ("ko-signed",)):
         print("keyed path %s %s" % (k[1], k[2]))
     reasons = {c: why for _, c, why in KEYED}
     reasons.update({"ko-signed": "module signature (db key)", "artifact": "signed partition or UKI",
-                    "build-param": "key fingerprint or channel of the build"})
+                    "build-param": "key fingerprint or channel of the build",
+                    "inrelease": "third-party InRelease as fetched (re-signed upstream; the .debs pinned by the lock)"})
     # sizes (v2): strict for the verity hash tree and the disk image, for reference otherwise
-    for k in sorted(k for k in set(A) | set(B) if k[0] == "keyed" and k[1] not in ("ko-signed", "build-param")):
+    for k in sorted(k for k in set(A) | set(B) if k[0] == "keyed" and k[1] not in ("ko-signed", "build-param", "inrelease")):
         (_, sa), (_, sb) = sized(A, k), sized(B, k)
         strict = k[1] == "artifact" and SIZE_STRICT.search(k[2]) is not None
         if sa is None or sb is None:
@@ -336,7 +425,7 @@ def compare(a, b):
     print("keyed ko-signed: %d modules, each with an equal unsigned-content `usr ko` line (checked above)" % sig)
     print("size: strict for *.usr-x86-64-verity.raw and <name>_<V>.raw, reference for the other keyed artifacts and files"
           " (v1 manifests carry no size); composition = the keyed path set (equal or DIFF above) and every stable line")
-    print("compare: %d lines, %d expected differences (keys/deployment), %d unexplained" % (len(set(A) | set(B)), len(expected), len(bad)))
+    print("compare: %d lines, %d expected differences (keys/deployment/InRelease fetch), %d unexplained" % (len(set(A) | set(B)), len(expected), len(bad)))
     return 0 if not bad else 1
 
 
@@ -349,10 +438,15 @@ def main():
     g.add_argument("--usr-image")
     g.add_argument("--usr-tree")
     m.add_argument("--input", action="append")
+    m.add_argument("--param", action="append")
+    m.add_argument("--apt-inputs")
     m.add_argument("--output")
     x = sub.add_parser("extract")
     x.add_argument("log")
     x.add_argument("--output")
+    x.add_argument("--block", default="build-manifest.txt", choices=["build-manifest.txt", "apt-pin-inputs.json"])
+    y = sub.add_parser("apt-inputs")
+    y.add_argument("file")
     c = sub.add_parser("compare")
     c.add_argument("a")
     c.add_argument("b")
@@ -361,6 +455,8 @@ def main():
         make(o)
     elif o.command == "extract":
         extract(o)
+    elif o.command == "apt-inputs":
+        sys.stdout.write("\n".join(sorted(apt_inputs_lines(json.load(open(o.file)))[0])) + "\n")
     else:
         sys.exit(compare(o.a, o.b))
 

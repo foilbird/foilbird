@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# The C toolchain of every CI agent build. ring (rustls, tonic) builds its C and assembly through musl-gcc and rustc
+# links the musl binaries through cc and ld, so these packages are inputs of foil-agent and foilctl as much as the
+# compiler of rust-toolchain.toml: another gcc or binutils gives other bytes (a build host's own gcc 14.2 and a CI
+# runner's gcc 13 gave two different foil-agent). CI builds the agent in the pinned Debian image of ci/run-stage.sh
+# (DEBIAN_IMAGE) with these packages from the build's own Debian snapshot (images/debian/reproducible.conf), installed
+# as name=version and checked after the install (ci/agent-toolchain.sh check); the agent's .comment section must carry
+# the gcc lines below (ci/agent-toolchain.sh comment); the versions actually installed go into the agent dist
+# (C-TOOLCHAIN) and from there into the build manifest (`input param <version> agent-toolchain:<package>`). A new snapshot with other versions fails both by name: change
+# them here, in a commit of its own, and rebuild the dist.
+#   package <name> <version>   installed as <name>=<version>, dpkg-query must report exactly that version
+#   comment <text>             a line `readelf -p .comment` must show in foil-agent; every "GCC: (...)" line of it must be
+#                              one of these: the Debian gcc that built ring, and the gcc of the C runtime rustc ships for
+#                              x86_64-unknown-linux-musl (self-contained crt, rust-toolchain.toml 1.100.0)
+# libc6-dev: the build scripts, proc macros and `cargo test` are built for the host target (glibc) by the same gcc.
+package gcc 4:14.2.0-1
+package gcc-14 14.2.0-19
+package gcc-14-x86-64-linux-gnu 14.2.0-19
+package cpp-14 14.2.0-19
+package libgcc-14-dev 14.2.0-19
+package binutils 2.44-3
+package binutils-x86-64-linux-gnu 2.44-3
+package libc6-dev 2.41-12+deb13u4
+package musl 1.2.5-3.1~deb13u1
+package musl-dev 1.2.5-3.1~deb13u1
+package musl-tools 1.2.5-3.1~deb13u1
+comment GCC: (Debian 14.2.0-19) 14.2.0
+comment GCC: (GNU) 9.4.0

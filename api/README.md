@@ -8,6 +8,16 @@
   system path, binary or URL; no untyped containers; `bytes` only by allowlist.
   Enforced by `tools/check_proto.py` (acceptance test T8; `tools/test_check_proto.sh`
   also checks a negative fixture).
+
+  > **v1-alpha limitation** (fix planned for v1-alpha4): the control plane's `k8s.init` (`K8sConfig.init`) is a kubeadm
+  > `InitConfiguration` and `ClusterConfiguration` document passed to `kubeadm init` as given. The agent checks only
+  > what the image requires of it: `kubeadm.k8s.io/v1beta4`, the image's kube-apiserver audit policy with the audit log
+  > on `/var`, the kubelet shutdown settings and the bootstrap token ttl. Everything else in it is not restricted, among
+  > it `extraArgs`, `extraVolumes` (host paths) and `imageRepository`. A client whose role may call `ApplyConfig` (not
+  > only `operator`) can therefore make a node that has no role yet a control plane running static pods and host mounts
+  > of its choice: on such a node that is equivalent to root. The boundary is who is issued a certificate of such a
+  > role. The role of a configured node cannot change and `kubeadm init` runs once. T8 checks field names and types; it
+  > cannot see inside this text.
 - Network locations are typed parts, never URLs: `endpoint` (`host[:port]`) + `prefix`
   (path, `[A-Za-z0-9._~/-]`, no `..`) + `ca_pem`. The scheme is fixed by the field (always
   https for `UpdateChannel`, `RegistryMirror`), so plain http, user info, query and fragment

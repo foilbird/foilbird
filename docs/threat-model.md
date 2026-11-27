@@ -30,6 +30,15 @@ scope.
 | a broken release does not keep the node | boot counting; the agent confirms a boot only when its health checks pass; the previous release boots after the last try | — | [decision 0003](decisions/0003-boot-loop-recovery.md), [boot-assessment.md](boot-assessment.md) | T7 (harness scenario `60-t7`) |
 | `/var` is unreadable on a stolen disk | LUKS2, one TPM2 slot, PCR 7 and a signed PCR 11 policy | C | [disk-encryption.md](disk-encryption.md) | — (the harness boot check reads that `/var` is LUKS2 bound to the TPM; no test reads a stolen disk) |
 
+> **v1-alpha limitation** (fix planned for v1-alpha4): row "no RPC executes a command": a control plane's `k8s.init` is
+> passed to `kubeadm init` as given, so on a node without a role `ApplyConfig` with it is equivalent to root
+> ([api/README.md](../api/README.md#rules), "Rules").
+
+> **v1-alpha limitation** (fix planned for v1-alpha4): row "`/var` is unreadable on a stolen disk": this holds for a
+> disk without its machine; with the node itself (disk and TPM together) a plain `/var` put in its place boots, its
+> configuration is applied and the TPM policy of the original `/var` is still met
+> ([disk-encryption.md](disk-encryption.md#disks-set-up-before-var-encryption)).
+
 ## Container escape
 
 **`container-host` (outside v1-alpha).** A container escape does not give persistence and root control of the node, in

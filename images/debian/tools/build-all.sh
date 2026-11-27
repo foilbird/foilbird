@@ -199,7 +199,19 @@ step "agent staged from $dist"
 
 step "apt-pin.py prepare ${only[*]:-(every set installed)}"
 "${tx[@]}" python3 "$here/tools/apt-pin.py" prepare "${confs[@]}" --cache "$cache" --out-dir "$here/mkosi" "${only[@]}"
-inputs=("${locks[@]}" --input "apt-pin-inputs.json=$here/mkosi/apt-pin-inputs.json" --input "agent-dist/SHA256SUMS=$dist/SHA256SUMS")
+# apt-pin-inputs.json: a stable part (strict) and the fields of the InRelease as fetched (keyed), build-manifest.py --apt-inputs
+inputs=("${locks[@]}" --apt-inputs "$here/mkosi/apt-pin-inputs.json" --input "agent-dist/SHA256SUMS=$dist/SHA256SUMS")
+# the C toolchain the dist was built with (C-TOOLCHAIN: "<package> <version>", written by the CI agent step from the
+# container, ci/agent-toolchain.sh record): one `input param` line per package, compared strictly; a dist without it (an
+# agent built outside that container) is recorded as such
+if [ -s "$dist/C-TOOLCHAIN" ]; then
+  while read -r n v x; do
+    [ -n "$n" ] && [ -n "$v" ] && [ -z "$x" ] || die "--agent-dist: $dist/C-TOOLCHAIN: expected '<package> <version>' lines"
+    inputs+=(--param "agent-toolchain:$n=$v")
+  done < "$dist/C-TOOLCHAIN"
+else
+  inputs+=(--param "agent-toolchain=unrecorded")
+fi
 if [ -n "$profile" ] && [ -f "$profile/tools/fetch-upstream.py" ]; then
   step "fetch-upstream.py prepare ${only_profile[*]:-(every set a component)}"
   "${tx[@]}" python3 "$profile/tools/fetch-upstream.py" prepare --cache "$cache" --out "$profile/upstream" "${only_profile[@]}"

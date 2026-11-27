@@ -40,6 +40,10 @@ What holds and what checks it:
 - Clients reach a node only through the agent over mutual TLS; the role is the client certificate's OU
   ([api/README.md](api/README.md); T12; `RaiseMinVersion` operator only, harness scenario `70-epoch`).
 - No RPC carries a command, script, path or URL (T8); the image has nothing to log in with or to run a script with (T5).
+
+  > **v1-alpha limitation** (fix planned for v1-alpha4): a control plane's `k8s.init` is passed to `kubeadm init` as
+  > given, so on a node without a role `ApplyConfig` with it is equivalent to root
+  > ([api/README.md](api/README.md#rules), "Rules").
 - `/usr` is erofs on signed dm-verity, booted from a signed UKI under Secure Boot; `/var` is LUKS2 bound to the TPM, and
   a release below the anti-rollback floor does not open it (T3, T20b; [decision
   0010](docs/decisions/0010-root-on-the-node-and-var-recovery.md)).

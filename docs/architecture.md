@@ -33,6 +33,10 @@ fresh installation, and never on a node that already has `/var`. Sizes and label
 3. No RPC carries a command, a script, a file path, a binary or a URL; network locations are typed parts. The agent
    uses privileged mechanisms of the node internally (systemd, the update tooling); none of them is reachable as such
    through the API.
+
+   > **v1-alpha limitation** (fix planned for v1-alpha4): a control plane's `k8s.init` is passed to `kubeadm init` as
+   > given, so on a node without a role `ApplyConfig` with it is equivalent to root
+   > ([api/README.md](../api/README.md#rules), "Rules").
 4. Configuration is one typed `NodeConfig`: `ValidateConfig`, then `ApplyConfig` with the expected generation
    ([decision 0005](decisions/0005-config-schema-and-application.md)). The applied configuration is rendered into
    `/run`, so it is rebuilt from `/var` on every boot.

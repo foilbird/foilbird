@@ -16,8 +16,8 @@
 #              summary, verify + refusal probes against them; then the job FAILS ON PURPOSE: the locks are reviewed and
 #              committed, never taken from a run automatically
 #   cp         the k8s-worker image as built for a control plane (one image for CP and worker, the role is
-#              NodeConfig.role): NVIDIA userspace not installed, the NVIDIA open modules built from nvsrc/ and signed
-#              inside the job (never published, no upload). The agent as in selfcheck; the cache filled from the network
+#              NodeConfig.role): no NVIDIA component (no userspace, no kernel module, no toolkit; the NVIDIA sets only
+#              verified, apt-pin.py prepare --source-only, mkosi.build builds no module). The agent as in selfcheck; the cache filled from the network
 #              and verified against the COMMITTED locks; ephemeral TEST keys (tests/lib/keys.sh, tmpfs);
 #              images/debian/tools/build-all.sh (the same call as on a build host): lab-gate, build manifest into the log
 #              and its stable sections into the summary

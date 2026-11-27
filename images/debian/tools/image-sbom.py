@@ -214,8 +214,10 @@ def main():
                                                 {"name": "foilbird:base", "value": "%s %s" % (base, osr.get("VERSION_ID", ""))}]}
     if prov:
         image["properties"].append({"name": "foilbird:nvidia-inputs", "value": "/usr/share/foilbird/sbom/nvidia-inputs.json"})
-        image["properties"].append({"name": "foilbird:nvidia-repository", "value": "%s %s key %s InRelease %s" % (
-            prov["repository"], prov["version"], prov["key"]["fingerprint"], prov["inrelease"]["sha256"])})
+        # stable: the repository and the signing key, never the InRelease of one fetch (re-signed upstream; the build's
+        # own InRelease is in its build manifest)
+        image["properties"].append({"name": "foilbird:nvidia-repository", "value": "%s %s key %s" % (
+            prov["repository"], prov["version"], prov["key"]["fingerprint"])})
     body = json.dumps(uniq, sort_keys=True).encode()
     bom = {"bomFormat": "CycloneDX", "specVersion": "1.5",
            "serialNumber": "urn:uuid:%s" % uuid.uuid5(uuid.NAMESPACE_URL, "foilbird-sbom:" + hashlib.sha256(body).hexdigest()),

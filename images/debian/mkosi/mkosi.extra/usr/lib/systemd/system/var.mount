@@ -3,6 +3,9 @@ Description=Persistent /var
 Documentation=file:/usr/lib/foilbird/repart.d/30-var.conf
 DefaultDependencies=no
 Wants=foil-var-unlock.service
+# a failed unlock fails /var at once (the var-fs device wait is long for the first boot); a plain /var skips the
+# unlock by its condition, which is not a failure for Requires=
+Requires=foil-var-unlock.service
 After=foil-var-unlock.service
 Before=local-fs.target umount.target
 Conflicts=umount.target

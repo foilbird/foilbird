@@ -35,6 +35,15 @@ the design considers, what holds against each of them, and, in the same place, w
 | `/var` is unreadable on a stolen disk | LUKS2, one TPM2 slot, policy PCR 7 + signed PCR 11 policy | C |
 | a written ESP gives no TLS material or configuration to a product build | the product agent ignores TLS material and configuration on the ESP; reading them is a lab-only feature (`agent/README.md`, "Build") | C |
 
+> **v1-alpha limitation** (fix planned for v1-alpha4): "no exec over the API": a control plane's `k8s.init` is passed to
+> `kubeadm init` as given, so on a node without a role `ApplyConfig` with it is equivalent to root
+> ([api/README.md](../../api/README.md#rules), "Rules").
+
+> **v1-alpha limitation** (fix planned for v1-alpha4): "`/var` is unreadable on a stolen disk": this holds for a disk
+> without its machine; with the node itself (disk and TPM together) a plain `/var` put in its place boots, its
+> configuration is applied and the TPM policy of the original `/var` is still met
+> ([disk-encryption.md](../disk-encryption.md#disks-set-up-before-var-encryption)).
+
 ## Limits: what root on a running node can do
 
 These are not bugs to be fixed in v1-alpha. Some have no fix without remote attestation.

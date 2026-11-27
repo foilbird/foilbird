@@ -25,9 +25,17 @@ not available offline). The offline build is proven on GitHub Actions by the `of
 - The runner's tag is the project variable `NL_RUNNER_TAG`.
 - The runner host outlives the job (`NL_SHARED_HOST=1` in `.gitlab-ci.yml`): the job changes nothing of it outside its
   work directory — `HOME` and the TEST keys are there, no toolchain is removed and no docker image pruned, nothing is
-  installed with apt-get (the host packages of `ci/run-stage.sh` — `musl-tools rustup uidmap debian-archive-keyring
+  installed with apt-get (the host packages of `ci/run-stage.sh` — `uidmap debian-archive-keyring
   python3 git gnupg openssl erofs-utils`, for the harness also `fdisk xz-utils binutils` — are installed beforehand, a
   missing one fails its step by name), and the offline stage puts the host's agent tools set aside and back.
+- The agent is built in a container of the pinned Debian image with the C toolchain of `agent/c-toolchain.pins` from
+  the build's snapshot (the host's own gcc and rustup are not used; `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS` of the
+  job go into the container, `NL_DOCKER_CPUS` caps it, its name carries `NL_DOCKER_TAG`).
+- The host's `/etc/hosts`: the gpu image step makes both NVIDIA hosts unreachable with `0.0.0.0` lines in it. On a
+  shared host every stage saves the file when it starts (`ci/hosts-guard.sh save`, a copy beside the job's directory,
+  `NL_HOSTS_COPY`) and refuses to start when the file already carries such a line (left by a job before); the stage's
+  EXIT trap puts the file back and checks its sha256 against the copy, and the job's `after_script` does it again and
+  removes the copy (a cancelled job may never reach the trap).
 - Docker on the runner host: the job's containers and image carry the job id (`NL_DOCKER_TAG`), are removed when the
   stage starts and on its way out; `NL_DOCKER_CPUS` (a runner or project variable) gives each container `--cpus`,
   since docker's cgroup is outside any CPU quota of the runner.
@@ -129,17 +137,23 @@ What the network owner defines in their own documents (not here):
   regular files and directories) before the first step, `NL_PKGCACHE` and `--cache` are the bundle's own; a refusal stops
   the build before any root entry or mkosi. On a build host with the root wrapper (`NL_BUILD`), `NL_PKGCACHE` and
   `NL_OFFLINE` go as its `--pkgcache` and `--offline`, the only two values it takes from the caller.
-- The agent is built from its offline inputs (`offline-inputs.sh verify`, `install`, then `agent/build-release.sh`).
+- The agent is built from its offline inputs (`offline-inputs.sh verify`, `install`, then `agent/build-release.sh`), in
+  the online agent container's packages committed as a local image and run with `--network none`.
 
 ## The offline stage (GitHub Actions, `offline.yml`, `ci/run-stage.sh offline`)
 
-One job, nothing leaves it (no upload; only manifests and the summary go to the log). The job is manual (a push to a
-`ci/offline-try-*` branch, an `offline-try-*` tag) and is not part of `build.yml`: a green pipeline without it proves nothing
-about the offline build; only this job's run on GitHub Actions does. `.gitlab-ci.yml` has the same stage as its manual
-`offline` job (web or an `offline-try-*` tag; the commit carries an `offline-try-*` tag).
+One job per image variant, `NL_OFFLINE_VARIANT` = `cp` or `gpu` (a matrix in `offline.yml`, each job on its own runner;
+`cp` when unset); nothing leaves a job (no upload; only manifests and the summary go to the log). The jobs are manual (a
+push to a `ci/offline-try-*` branch, an `offline-try-*` tag) and are not part of `build.yml`: a green pipeline without them
+proves nothing about the offline build; only their run on GitHub Actions does. `.gitlab-ci.yml` has the same stage as its
+manual `offline` (cp) and `offline-gpu` jobs (web or an `offline-try-*` tag; the commit carries an `offline-try-*` tag);
+a runner with concurrency 1 runs them one after the other. Every step below is of the job's variant; the stage writes
+the disk use of `/` and of its work directory after the online build, after the bundle, after the offline build and at
+its end (`disk (<variant>) …` lines), since a gpu bundle is the largest thing on the runner's disk.
 
 
-1. an online cp build with `NL_PKGCACHE` (manifest A);
+1. an online build of the variant with `NL_PKGCACHE` (manifest A); for `gpu` with both NVIDIA hosts made unreachable after
+   the fetch, as in the `gpu` stage (on a shared host the hosts file comes back on the way out);
 2. the bundle, signed with an ephemeral TEST key of the role made in the job (a mechanism check only; its fingerprint is
    only in this job's list; its private part is removed right after the probes, and on any failure of the stage);
 3. refusal probes, each on a copy of the bundle, each refused with its own reason: a changed file; an extra and a missing
@@ -156,7 +170,7 @@ about the offline build; only this job's run on GitHub Actions does. `.gitlab-ci
    restore, the apt chain on the runner host itself with the restored tools tree's sqv (the path of a build host without
    the tools container): the intact bundle passes, a changed `.deb` is refused;
 4. every online leftover removed (tools trees, mkosi's cache and output, the mkosi clone, the caches, `~/.cargo`,
-   `~/.rustup`, the agent's `target/`), what stays listed with `du`. The online build writes into the tree as root:
+   `~/.rustup`, the agent container's rustup and cargo in `$CI_TMP/agent-home`, the agent's `target/`), what stays listed with `du`. The online build writes into the tree as root:
    `apt-pin.py`/`fetch-upstream.py prepare` in the tools container (`aptpin/`, `nvsrc/`, `pinned.conf`,
    `apt-pin-inputs.json`, `upstream/`, `__pycache__/`) and `sudo mkosi` (the images under `out/`, the empty mount points
    of `BuildSources=` in `images/debian/mkosi`). The clean removes them as root, the user that wrote them, and then
@@ -165,12 +179,17 @@ about the offline build; only this job's run on GitHub Actions does. `.gitlab-ci
    path (root writes, the runner user cleans) is checked only here;
 5. the network cut **for the build only**: a network namespace with `lo` and a dummy default route, where iptables and
    ip6tables count every packet but `lo` (UDP 53 included: its `resolv.conf` names an address behind the dummy route)
-   and drop it; the tools container runs with `--network none`. Probes inside (DNS and TCP to the public archives) must
-   fail, and each must be counted and dropped (its own counter file: counted > 0, dropped = counted); a control outside
+   and drop it. Two mechanisms, each for its own part: **mkosi (build-all.sh) runs in that namespace, its packets counted
+   in `count-build`**; **the agent is built in its container with `--network none`** (no interface but `lo`, read back
+   with `docker inspect` before the build; no counter, there is nothing to count) and the tools container runs with
+   `--network none` as well. Probes inside (DNS and TCP to the public archives; for `gpu`
+   also both NVIDIA hosts) must fail, and each must be counted and dropped (its own counter file: counted > 0, dropped = counted); a control outside
    must reach the network (the runner keeps its own connection, a host-wide drop would cut it);
-6. the bundle verified, cp built again from it alone, with `NL_OFFLINE=1` (manifest B);
+6. the bundle verified, the same variant built again from it alone, with `NL_OFFLINE=1` (manifest B);
 7. `build-manifest.py compare A B` over the closed keyed list: exit 0; the counter file of the offline build present and
-   well-formed (missing = FAIL, never "0 packets"), no packet counted during the offline build.
+   well-formed (missing = FAIL, never "0 packets"), no packet counted during the offline build. The agent's C toolchain
+   is part of both manifests (`input param <version> agent-toolchain:<package>`, from the dist's `C-TOOLCHAIN`) and
+   compared strictly like every input.
 
 ## Running it in a closed network
 

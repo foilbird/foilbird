@@ -1,8 +1,9 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
-# The offline part of the CI stage "offline" (ci/run-stage.sh offline, docs/ci-gitlab.md): after an online cp build of
-# the same job (manifest A, mkosi's package cache in $T/pkgcache), build the input bundle, try to break it, remove every
-# online leftover, cut the network, build cp again from the bundle alone (manifest B) and compare A with B.
+# The offline part of the CI stage "offline" (ci/run-stage.sh offline, docs/ci-gitlab.md): after an online build of the
+# variant (NL_OFFLINE_VARIANT: cp, the default, or gpu) in the same job (manifest A, mkosi's package cache in $T/pkgcache),
+# build the input bundle, try to break it, remove every online leftover, cut the network, build the same variant again
+# from the bundle alone (manifest B) and compare A with B.
 #   ci/offline.sh bundle|probes|clean|net|build|compare      (CI_TMP=$T, the tree is the script's parent)
 # The network is cut in a network namespace, not on the host: a host-wide DROP would also cut the CI runner's own
 # connection. The namespace has lo and a dummy interface with the default route (192.0.2.1/24, TEST-NET-1), so that every
@@ -20,8 +21,21 @@ top=$(cd "$(dirname "$0")/.." && pwd)
 T=${CI_TMP:?CI_TMP}; SUM=${CI_SUMMARY:-$T/summary.md}
 KEYS=${CI_TEST_KEYS:-/dev/shm/ci-test-keys}   # the image's TEST keys of the online build (ci/run-stage.sh)
 B=$T/bundle; NS=$T/netns
+# the variant of the stage: the online build A (ci/run-stage.sh), the probe builds and the offline build B are the same one
+V=${NL_OFFLINE_VARIANT:-cp}
+case $V in cp|gpu) ;; *) echo "offline.sh: NL_OFFLINE_VARIANT [$V]: cp or gpu" >&2; exit 2 ;; esac
 fail() { echo "OFFLINE FAIL ($1): $2" | tee -a "$SUM"; exit 1; }
+# failtail <log> <step> <reason>: the last 20 non-empty lines of a step's log into the job log, then OFFLINE FAIL with
+# the reason and the log's last non-empty line (a log that ends with an empty line, or an empty one, gave an empty reason:
+# G8 alpha3 job 18, "offline-inputs.sh fetch: ")
+lastline() { grep -v '^[[:space:]]*$' "$1" 2>/dev/null | tail -n "${2:-1}" || true; }
+failtail() {
+  echo "--- $1: $(wc -l 2>/dev/null < "$1" || echo 'no log,') lines; the last 20 non-empty:"; lastline "$1" 20; echo "--- end of $1"
+  fail "$2" "$3; last line: $(lastline "$1" | cut -c1-300)"
+}
 say() { echo "$*" | tee -a "$SUM"; }
+# disk at the points where the stage holds the most (the runner's disk is the limit of a gpu bundle; docs/ci-gitlab.md)
+dfp() { say "disk ($V) $1: $(df -h --output=target,used,avail / "$T" 2>/dev/null | awk 'NR > 1 && !s[$1]++ {printf "%s used %s free %s; ", $1, $2, $3}')$T $(du -sh "$T" 2>/dev/null | cut -f1)"; }
 
 # a TEST key of the bundle-signing role: gpg home, primary fingerprint, a public keyring for gpgv
 mkkey() { # mkkey <dir> <name> [extra gpg options...]
@@ -34,7 +48,17 @@ sign_as() { rm -f "$2/MANIFEST.sha256.sig"; gpg --homedir "$1" --batch --yes --p
 
 # the tools container of the offline part: the online o2tools (its packages installed) committed locally, no network
 DK_TOOLS=${DK_TOOLS:-o2tools}; DK_OFF=${DK_OFF:-o2tools-off}; DK_IMG=${DK_IMG:-nl-o2tools-offline}   # the job's docker names (ci/run-stage.sh)
+DK_AOFF=${DK_AOFF:-o2tools-agent-off}; DK_AFETCH=${DK_AFETCH:-o2tools-agent-fetch}; DK_AIMG=${DK_AIMG:-nl-agent-tools}
 DCPU=(); [ -z "${NL_DOCKER_CPUS:-}" ] || DCPU=(--cpus "$NL_DOCKER_CPUS")
+# the agent's container image of this job (step agent of ci/run-stage.sh: the pinned Debian image with the C toolchain of
+# agent/c-toolchain.pins): the offline inputs are fetched in it (its rustup, the toolchain the agent step installed in
+# $T/agent-home) and the agent is built offline in it with --network none; both as the caller, in the tree's agent/
+TB=/opt/foilbird-build-tools
+agent_env() { # agent_env <home>: the environment options of the agent's runs (the same as the agent step's)
+  AE=(-e HOME="$1" -e SOURCE_DATE_EPOCH="$(git -C "$top" log -1 --format=%ct)")
+  [ -z "${CARGO_BUILD_JOBS:-}" ] || AE+=(-e "CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS")
+  [ -z "${RUST_TEST_THREADS:-}" ] || AE+=(-e "RUST_TEST_THREADS=$RUST_TEST_THREADS")
+}
 OFFLINE_TOOLS="docker exec -w $top $DK_OFF"
 tools_offline() {
   docker inspect "$DK_OFF" > /dev/null 2>&1 && return 0
@@ -84,10 +108,17 @@ do_bundle() {
   [ -s "$T/dist/SHA256SUMS" ] || fail bundle "no online agent dist ($T/dist/SHA256SUMS)"
   sha256sum < "$T/dist/SHA256SUMS" | cut -c1-64 > "$T/agent-dist-online.sha256"
   cp "$T/out/build-manifest.txt" "$T/manifest-online.txt" || fail bundle "no online manifest ($T/out/build-manifest.txt)"
+  dfp "after the online build"
   tools_offline
   if [ -x "$top/agent/tools/offline-inputs.sh" ]; then
-    "$top/agent/tools/offline-inputs.sh" fetch "$T/agent-inputs" > "$T/agent-inputs.log" 2>&1 || fail bundle "offline-inputs.sh fetch: $(tail -n 1 "$T/agent-inputs.log")"
-    ag=(--agent-inputs "$T/agent-inputs"); say "agent offline inputs: agent/tools/offline-inputs.sh fetch"
+    # in the agent's container (network on): cargo vendor with the toolchain of the agent step, no rustup of the host
+    docker image inspect "$DK_AIMG" > /dev/null 2>&1 || fail bundle "no agent container image $DK_AIMG (step agent keeps it in the offline stage)"
+    agent_env "$T/agent-home"
+    rc=0; docker run --rm "${DCPU[@]}" --name "$DK_AFETCH" -u "$(id -u):$(id -g)" -v "$top:$top" -v "$T:$T" -w "$top/agent" "${AE[@]}" \
+      -e RUSTUP_HOME="$T/agent-home/rustup" -e CARGO_HOME="$T/agent-home/cargo" "$DK_AIMG" \
+      "$top/agent/tools/offline-inputs.sh" fetch "$T/agent-inputs" > "$T/agent-inputs.log" 2>&1 || rc=$?
+    [ "$rc" = 0 ] || failtail "$T/agent-inputs.log" bundle "offline-inputs.sh fetch rc=$rc, PROVENANCE $(wc -l 2>/dev/null < "$T/agent-inputs/PROVENANCE" || echo none) lines"
+    ag=(--agent-inputs "$T/agent-inputs"); say "agent offline inputs: agent/tools/offline-inputs.sh fetch (in $DK_AIMG)"
   elif [ "${NL_OFFLINE_AGENT_REQUIRED:-0}" = 1 ]; then
     fail bundle "agent/tools/offline-inputs.sh missing (counted run: the agent must be built offline)"
   else
@@ -114,6 +145,7 @@ do_bundle() {
   [ "$rc" = 0 ] || fail bundle "the apt chain of the bundle (bundle-apt-verify.py rc=$rc; 124 = timeout)"
   # regression probe: the bare name "sqv" is resolved to an absolute path, not to the PATH wrapper (offline-try-3 hang)
   grep -q '^apt-verify: sqv /' "$T/aptv.txt" && grep -qx 'APT-VERIFY PASS' "$T/aptv.txt" || fail bundle "probe a-bare-sqv: the sqv command not resolved to an absolute path"
+  dfp "bundle made"
   say "probe a-bare-sqv: \"sqv\" resolved to $(sed -n '/^apt-verify: sqv /{s/^apt-verify: sqv \([^ ]*\) .*/\1/p;q}' "$T/aptv.txt"), apt chain PASS"
 }
 
@@ -190,7 +222,7 @@ do_probes() {
   ba() { # ba <bundle> [--check-inputs]: build-all.sh offline from <bundle>, the inputs of the offline build
     env NL_OFFLINE=1 NL_BUNDLE="$1" NL_PKGCACHE="$1/pkgcache" "${base[@]}" TOOLS_EXEC="$OFFLINE_TOOLS" \
       SOURCE_DATE_EPOCH="$(git -C "$top" log -1 --format=%ct)" "$top/images/debian/tools/build-all.sh" \
-      --profile "$top/profiles/k8s-worker" --variant cp --version 1 --epoch 1 --min-version 1 \
+      --profile "$top/profiles/k8s-worker" --variant "$V" --version 1 --epoch 1 --min-version 1 \
       --keys "$KEYS" --agent-dist "$T/dist" --cache "$1/apt-cache" --output-dir "$P/out" "${@:2}" 2>&1
   }
   n=$((n + 1)); fresh; mkdir -p "$P/out"
@@ -254,7 +286,7 @@ do_clean() {
   ts_root=$(cd "$top/agent" && ./build-release.sh --print-tools-root) || fail clean "build-release.sh --print-tools-root"
   case $ts_root in /opt/foilbird-build-tools/?*) ;; *) fail clean "tools set directory not under /opt/foilbird-build-tools/: [$ts_root]" ;; esac
   case $ts_root in */../*|*/..|*/./*|*//*) fail clean "tools set directory $ts_root has . or .. or //" ;; esac
-  sudo rm -rf --one-file-system "$T/mkosi" "$T/apt-cache" "$T/pkgcache" "$T/out" "$T/dist" "$T/agent-inputs" "$HOME/.cargo" "$HOME/.rustup" "$top/agent/target" "$ts_root"
+  sudo rm -rf --one-file-system "$T/mkosi" "$T/apt-cache" "$T/pkgcache" "$T/out" "$T/dist" "$T/agent-inputs" "$T/agent-home" "$HOME/.cargo" "$HOME/.rustup" "$top/agent/target" "$ts_root"
   # removed by root, the user that wrote them (the tools container, mkosi): apt-pin.py prepare's out-dir, fetch-upstream.py's
   # out, the images of the online build under out/ (out/.keep is in git), the empty BuildSources mount points mkosi made
   # in images/debian/mkosi, the bytecode of the tree's tools written by python3 as root
@@ -349,7 +381,10 @@ do_net() {
     else say "probe idle: FAIL (counted $c, dropped $d: the namespace itself sends; $(tr '\n' ' ' < "$NS/count-idle"))"; bad=1; fi
   fi
   say "names: runner nsswitch $(grep -E '^[[:space:]]*hosts:' /etc/nsswitch.conf | tr -s ' \t' ' ' || echo 'hosts: none'); namespace nsswitch $(grep -E '^hosts:' "$NS/nsswitch.conf" 2>/dev/null || echo 'hosts: none'), $(wc -l < "$NS/nsswitch.conf" 2>/dev/null) lines of $(wc -l < /etc/nsswitch.conf); namespace hosts $(tr '\n' ';' < "$NS/hosts" 2>/dev/null)"
-  for h in snapshot.debian.org github.com static.rust-lang.org; do
+  local hs="snapshot.debian.org github.com static.rust-lang.org"
+  # gpu: both NVIDIA hosts too (the online part made them 0.0.0.0 in the host's hosts file; the namespace has its own)
+  if [ "$V" = gpu ]; then hs="$hs developer.download.nvidia.com nvidia.github.io"; fi
+  for h in $hs; do
     if ns_run "$NS/count-dns-$h" PATH="$PATH" timeout 10 getent hosts "$h" > /dev/null 2>&1; then echo "probe DNS $h: resolved (network open)"; bad=1; else echo "probe DNS $h: no answer, as expected"; fi
     probe_count "DNS $h" "$NS/count-dns-$h" || bad=1
     if ns_run "$NS/count-tcp-$h" PATH="$PATH" curl -s -m 10 -o /dev/null "https://$h/" 2>/dev/null; then echo "probe TCP $h: connected (network open)"; bad=1; else echo "probe TCP $h: no connection, as expected"; fi
@@ -363,15 +398,27 @@ do_net() {
 }
 
 do_build() {
-  mkdir -p "$NS"; rm -f "$NS/count-agent" "$NS/count-build"
+  mkdir -p "$NS"; rm -f "$NS/count-build"
   NL_BUNDLE_FPR=$(cat "$T/bkey.fpr") NL_BUNDLE_KEYRING=$T/bkeyring.gpg "$top/ci/bundle.sh" verify "$B" --tree "$top" | tee -a "$SUM"
   # the agent first (it needs no tools tree of mkosi): the dist of the probe and of the build below is the one built here
   # (the bundle carries agent-inputs/dist only in the interim, without the agent's offline inputs)
   local dist=$B/agent-inputs/dist
   if [ -x "$top/agent/tools/offline-inputs.sh" ]; then
     "$top/agent/tools/offline-inputs.sh" verify "$B/agent-inputs" || fail build "offline-inputs.sh verify"
-    # the agent built offline from the bundle (offline-inputs.sh install prints the environment for build-release.sh)
-    ns_run "$NS/count-agent" PATH="$PATH" HOME="$HOME" bash -c "eval \"\$('$top/agent/tools/offline-inputs.sh' install '$B/agent-inputs' '$T/agent-tools')\" && cd '$top/agent' && OUT='$T/dist-offline' ./build-release.sh" > "$T/agent-offline.log" 2>&1 || fail build "agent offline build: $(tail -n 1 "$T/agent-offline.log")"
+    # the agent built offline from the bundle (offline-inputs.sh install prints the environment for build-release.sh), in
+    # the agent's container image with no network at all (--network none, read back): the C toolchain is the online one
+    docker rm -f "$DK_AOFF" > /dev/null 2>&1 || true
+    docker run -d "${DCPU[@]}" --name "$DK_AOFF" --network none -v "$top:$top" -v "$T:$T" -v "$TB:$TB" -w "$top/agent" "$DK_AIMG" sleep infinity > /dev/null ||
+      fail build "docker run $DK_AIMG --network none"
+    [ "$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$DK_AOFF")" = none ] || fail build "the agent container $DK_AOFF has a network"
+    "$top/ci/agent-toolchain.sh" check docker exec "$DK_AOFF" | tee -a "$SUM" || fail build "the C toolchain of $DK_AOFF is not agent/c-toolchain.pins"
+    mkdir -p "$T/agent-home-offline"; agent_env "$T/agent-home-offline"
+    rc=0; docker exec -u "$(id -u):$(id -g)" "${AE[@]}" "$DK_AOFF" bash -c "eval \"\$('$top/agent/tools/offline-inputs.sh' install '$B/agent-inputs' '$T/agent-tools')\" && OUT='$T/dist-offline' ./build-release.sh" > "$T/agent-offline.log" 2>&1 || rc=$?
+    [ "$rc" = 0 ] || failtail "$T/agent-offline.log" build "agent offline build (offline-inputs.sh install, build-release.sh) rc=$rc"
+    "$top/ci/agent-toolchain.sh" comment "$T/dist-offline/foil-agent" docker exec "$DK_AOFF" | tee -a "$SUM" || fail build "agent .comment of the offline dist"
+    "$top/ci/agent-toolchain.sh" record "$T/dist-offline/C-TOOLCHAIN" docker exec "$DK_AOFF" || fail build "agent-toolchain.sh record (offline dist)"
+    say "agent built offline in $DK_AOFF (network $(docker inspect -f '{{.HostConfig.NetworkMode}}' "$DK_AOFF"))"
+    docker rm -f "$DK_AOFF" > /dev/null 2>&1 || true
     dist=$T/dist-offline
   fi
   # the agent built offline is the online one: SHA256SUMS of both dists equal (the binaries and the SBOM of the agent).
@@ -390,7 +437,7 @@ do_build() {
   # probe: after the clean there is no tools tree; an offline build without the bundle's is refused, never rebuilt
   if out=$(env NL_OFFLINE=1 NL_BUNDLE="$B" NL_PKGCACHE="$B/pkgcache" NL_BUNDLE_FPR="$(cat "$T/bkey.fpr")" NL_BUNDLE_KEYRING="$T/bkeyring.gpg" \
       TOOLS_EXEC="$OFFLINE_TOOLS" SOURCE_DATE_EPOCH="$(git -C "$top" log -1 --format=%ct)" "$top/images/debian/tools/build-all.sh" \
-      --profile "$top/profiles/k8s-worker" --variant cp --version 1 --epoch 1 --min-version 1 --keys "$KEYS" \
+      --profile "$top/profiles/k8s-worker" --variant "$V" --version 1 --epoch 1 --min-version 1 --keys "$KEYS" \
       --agent-dist "$dist" --cache "$B/apt-cache" --output-dir "$T/out-offline" --check-inputs 2>&1); then
     fail build "probe t-no-tools-tree: an offline build without a restored tools tree was not refused"
   fi
@@ -419,16 +466,16 @@ do_build() {
   ns_run "$NS/count-build" PATH="$T/offline-mkosi/mkosi/bin:$PATH" HOME="$HOME" NL_BUILD="${NL_BUILD:-}" NL_OFFLINE=1 NL_PKGCACHE="$B/pkgcache" TOOLS_EXEC="$OFFLINE_TOOLS" \
     NL_BUNDLE="$B" NL_BUNDLE_FPR="$(cat "$T/bkey.fpr")" NL_BUNDLE_KEYRING="$T/bkeyring.gpg" \
     SOURCE_DATE_EPOCH="$(git -C "$top" log -1 --format=%ct)" "$top/images/debian/tools/build-all.sh" \
-    --profile "$top/profiles/k8s-worker" --variant cp --version 1 --epoch 1 --min-version 1 \
+    --profile "$top/profiles/k8s-worker" --variant "$V" --version 1 --epoch 1 --min-version 1 \
     --keys "$KEYS" --agent-dist "$dist" --cache "$B/apt-cache" --output-dir "$T/out-offline" > "$T/build-offline.log" 2>&1 \
     || { tail -n 40 "$T/build-offline.log"; fail build "build-all.sh offline"; }
   say "offline apt: Get/Hit lines from the network $(grep -c -E '^(Get|Hit):[0-9]+ (https?|ftp)://' "$T/build-offline.log" || true), signature checks $(grep -c -i -E 'signature|InRelease' "$T/build-offline.log" || true)"
   say "network counter during the offline build: $(tr '\n' ' ' < "$NS/count-build" 2>/dev/null || echo 'MISSING')"
+  dfp "after the offline build"
 }
 
 do_compare() {
-  local f p=0 d=0 fs=("$NS/count-build")
-  [ ! -x "$top/agent/tools/offline-inputs.sh" ] || fs+=("$NS/count-agent")   # the agent was built in the namespace too
+  local f p=0 d=0 fs=("$NS/count-build")   # the agent was built offline in a container with --network none (do_build)
   # the counters first: a missing or malformed file means the offline build was not counted, never "0 packets"
   for f in "${fs[@]}"; do
     cnt_ok "$f" || fail compare "network counter $f missing or malformed: the offline build was not counted"
@@ -441,7 +488,9 @@ do_compare() {
   [ "$rc" = 0 ] || fail compare "the offline image differs from the online one"
   [ "$p" = 0 ] || fail compare "the offline build sent $p packets"
   echo "=== BEGIN build-manifest.txt"; cat "$T/out-offline/build-manifest.txt"; echo "=== END build-manifest.txt"
-  say "OFFLINE STAGE PASS"
+  f=$top/images/debian/mkosi/apt-pin-inputs.json; [ ! -f "$f" ] || { echo "=== BEGIN apt-pin-inputs.json"; sed '$a\' "$f"; echo "=== END apt-pin-inputs.json"; }
+  dfp "end of the stage"
+  say "OFFLINE STAGE PASS (variant $V)"
 }
 
 case ${1:-} in

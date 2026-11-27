@@ -21,7 +21,7 @@ fn arg_value(args: &[String], name: &str) -> Option<String> {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt().with_ansi(false).without_time().with_target(false).init();
+    foil_agent::logfmt::init();   // `<N>` priority prefix when stdout is the journal (audit WARN = priority 4)
     let args: Vec<String> = std::env::args().skip(1).collect();
     let paths = Paths::from_env();
     let r = match args.first().map(String::as_str) {

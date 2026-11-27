@@ -5,6 +5,7 @@ pub mod authz;
 pub mod compat;
 pub mod config;
 pub mod journal;
+pub mod logfmt;
 pub mod rollback;
 pub mod server;
 pub mod system;

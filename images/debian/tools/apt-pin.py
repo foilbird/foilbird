@@ -76,6 +76,13 @@ TRUSTED = {
         "fingerprint": "DE15B14486CD377B9E876E1A234654DA9A296436",
         "key": ("url", "https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key")},
 }
+# the fields of a set's provenance that come from the InRelease and the index as fetched: the three repositories are not
+# snapshots and re-sign their InRelease (NVIDIA every few days), an InRelease cannot be fetched again once replaced. They
+# stay in apt-pin-inputs.json (the build input: build-manifest.py records them as keyed, FETCH_FIELDS there, the same
+# list) and never reach the image: the provenance file a set gives to the image (provenance =, image_prov) carries the
+# key, the repository, origin/label/suite, every .deb and the sha256 of the lock, not these
+FETCH_FIELDS = (("inrelease", ("sha256", "date", "valid_until")), ("index", ("sha256", "sha512", "size")),
+                ("packages_gz", ("sha256", "sha512", "size")))
 WEAK_DIGESTS = {1: "MD5", 2: "SHA1", 3: "RIPEMD160"}  # RFC 4880 hash algorithm ids
 DIGEST_NAMES = {**WEAK_DIGESTS, 8: "SHA256", 9: "SHA384", 10: "SHA512", 11: "SHA224"}
 INDEXES = ("Packages.gz", "Packages.xz", "Packages")    # first one listed in the signed InRelease is used
@@ -423,7 +430,7 @@ def load_index(s, cache, keyring):
                 "signature_digests": sorted({d for _, _, d in signature_packets(keyring) if d is not None}),
                 "sha256": digest(keyring)},
         "inrelease": {"sha256": digest(ir), "date": fields.get("Date"), "valid_until": fields.get("Valid-Until"),
-                      "origin": fields.get("Origin"), "label": fields.get("Label"),
+                      "origin": fields.get("Origin"), "label": fields.get("Label"), "suite": fields.get("Suite"),
                       "signature_digests": sorted(set(dig)),
                       "verifier": sqv_version()},
         "index": {"name": name, alg: want, "size": size},
@@ -504,10 +511,28 @@ def verify_set(s, cache, lock, keyring_override=None):
         prov["key"]["file_sha256"] = digest(kp)
     if lock is not None:
         check_lock(s, lockable, lock)
+        # reached only when every check passed (any failure raised above): the line build-manifest.py records strictly
+        prov["chain_check"] = ("ok: InRelease signed by key %s (sqv), %s = the signed InRelease, %d files = their Packages "
+                               "stanza (sha256, size) = the lock" % (s.anchor["fingerprint"], iname, len(lockable)))
+        prov["lock_sha256"] = digest(lock_path(s.conf))
     prov.update({"version": s.version, "license": s.license, "files": files,
                  "lock": None if lock is None else tree_rel(lock_path(s.conf)),
                  "chain": "file <- Packages <- %s in signed InRelease <- sqv signature <- key %s" % (iname, s.anchor["fingerprint"])})
     return prov, keyring_bytes, iname, lockable
+
+
+def image_prov(prov):
+    """The provenance of a set as the image carries it: without the fields of the InRelease and index as fetched
+    (FETCH_FIELDS), so two builds that fetched on different days give the same image."""
+    out = json.loads(json.dumps(prov))
+    for sec, keys in FETCH_FIELDS:
+        if isinstance(out.get(sec), dict):
+            for k in keys:
+                out[sec].pop(k, None)
+            if not out[sec]:
+                out.pop(sec)
+    out["fetched_fields"] = "not in the image: the InRelease and index of this build are in its build manifest (keyed inrelease)"
+    return out
 
 
 def fetch_set(s, cache, refresh=False):
@@ -548,8 +573,9 @@ def prepare(confs, cache, out_dir, source_only=()):
          srv/apt-pin/<set>/         the cached repository subset: the original signed InRelease and index and the pinned
                                     .debs; apt in the build verifies them again
        <source-dir>/                source packages (never installed) + origin.txt, for mkosi.build
-       <provenance>                 the set's provenance (e.g. nvsrc/nvidia-inputs.json, copied into the image SBOM)
-       apt-pin-inputs.json          provenance of every set
+       <provenance>                 the set's provenance as the image carries it (image_prov: no InRelease/index fields
+                                    of the fetch; e.g. nvsrc/nvidia-inputs.json, copied into the image SBOM)
+       apt-pin-inputs.json          the full provenance of every set (the build input of the manifest)
        pinned.conf                  mkosi include: SandboxTrees=<out_dir>/aptpin (absolute) + every installed package
                                     pinned to its version
     A set named in source_only gets no apt source and no package in pinned.conf (only its source-dir and provenance)."""
@@ -612,7 +638,7 @@ def prepare(confs, cache, out_dir, source_only=()):
             pp = os.path.join(out_dir, s.provenance)
             os.makedirs(os.path.dirname(pp), exist_ok=True)
             with open(pp, "w") as f:
-                json.dump(prov, f, indent=2, sort_keys=True)
+                json.dump(image_prov(prov), f, indent=2, sort_keys=True)
                 f.write("\n")
     with open(os.path.join(out_dir, "apt-pin-inputs.json"), "w") as f:
         json.dump({"sets": [p for _, p, _, _ in provs], "source_only": sorted(source_only)}, f, indent=2, sort_keys=True)

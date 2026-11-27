@@ -15,21 +15,21 @@
 #   cp | gpu   preflight tag oss agent disk host snapshot keyfacts image  (image only after a passing agent step)
 #   harness    preflight tag oss agent disk host snapshot keyfacts image harness_rel harness_test  (the harness gate:
 #              make test STRICT=1 against releases 1-4 built in the job; tag harness-try-*)
-#   offline    as cp (NL_PKGCACHE: mkosi's package cache), then offline_bundle offline_probes offline_clean offline_net
-#              offline_build offline_compare (ci/offline.sh)
+#   offline    as cp or gpu (NL_OFFLINE_VARIANT, cp by default; NL_PKGCACHE: mkosi's package cache), then offline_bundle
+#              offline_probes offline_clean offline_net offline_build offline_compare (ci/offline.sh), all of that variant
 # Steps: preflight tag oss errexit agent disk host snapshot keyfacts initrd lock image harness_rel harness_test offline_* result
 # Every step runs in a process of its own (`bash ci/run-stage.sh __step <name>`, started by run_step): a step body called
 # from `"step_x" || rc=$?` (or under if/&&/!) runs with errexit ignored - its own `set -e` would do nothing (bash(1)) - so
 # a step never runs inside such a context; what a step decides on is still read explicitly (rc, PIPESTATUS, exit).
 # The child gets the state through the environment only: CI_TMP, CI_SUMMARY, STAGE, CI_TAG_GLOB, CI_REF, CI_GIT_AUTH,
-# CI_OWN, CI_LOG_GROUPS, MKOSI_*, DEBIAN_IMAGE, PATH, NL_PKGCACHE (offline stage) (exported); files under CI_TMP
+# CI_OWN, CI_LOG_GROUPS, MKOSI_*, DEBIAN_IMAGE, PATH, NL_PKGCACHE and NL_OFFLINE_VARIANT (offline stage) (exported); files under CI_TMP
 # (agent.outcome, dist, cache) are shared.
 #
 # Environment (the CI maps its own variables onto these; nothing CI-specific below):
 #   CI_TMP        work directory outside the tree (required): agent dist, cache, logs, mkosi, output
 #   CI_SUMMARY    file the summary lines are appended to (default: $CI_TMP/summary.md)
 #   STAGE         gate | selfcheck | lock | cp | gpu | harness | offline (the agent, image and harness steps read it;
-#                 offline builds its online image as cp)
+#                 offline builds its online image as NL_OFFLINE_VARIANT: cp or gpu, cp when unset)
 #   CI_TAG_GLOB   the tag the commit must carry, the build is "by tag" (default build-try-*; harness: harness-try-*)
 #   CI_REF        the branch being built: a ci/harness-try-* branch is always STAGE=harness (the stage of the harness gate
 #                 comes from the branch, so the commit built is the commit merged)
@@ -52,7 +52,9 @@ CI_SUMMARY=$SUM; export CI_TMP CI_SUMMARY
 # nothing of the host outside CI_TMP. HOME is in CI_TMP (cargo, rustup); the TEST keys are in CI_TMP, not on the tmpfs path
 # every job shares; the disk step removes no toolchain and prunes no docker image; no apt-get (the host packages are
 # installed beforehand, a missing one fails its step by name); the offline stage puts the agent's shared tools set aside
-# and puts it back on the way out. Unset (GitHub Actions, a fresh runner per job): none of this, as before.
+# and puts it back on the way out; the host's hosts file is saved when a stage starts and put back on the way out
+# (ci/hosts-guard.sh: the gpu image step writes 0.0.0.0 lines of the NVIDIA hosts into it). Unset (GitHub Actions, a
+# fresh runner per job): none of this, as before.
 CI_TEST_KEYS=/dev/shm/ci-test-keys
 if [ "${NL_SHARED_HOST:-0}" = 1 ]; then HOME=$T/home; mkdir -p "$HOME"; CI_TEST_KEYS=$T/test-keys; fi
 export HOME CI_TEST_KEYS
@@ -62,10 +64,21 @@ export HOME CI_TEST_KEYS
 case ${NL_DOCKER_TAG:-} in *[!A-Za-z0-9_.-]*) echo "run-stage.sh: NL_DOCKER_TAG [$NL_DOCKER_TAG]: only A-Za-z0-9_.-" >&2; exit 2 ;; esac
 case ${NL_DOCKER_CPUS:-} in *[!0-9.]*) echo "run-stage.sh: NL_DOCKER_CPUS [$NL_DOCKER_CPUS]: a number" >&2; exit 2 ;; esac
 DK_TOOLS=o2tools${NL_DOCKER_TAG:+-$NL_DOCKER_TAG}; DK_OFF=$DK_TOOLS-off; DK_IMG=nl-o2tools-offline${NL_DOCKER_TAG:+-$NL_DOCKER_TAG}
-export DK_TOOLS DK_OFF DK_IMG
+# the agent's container (step agent), its packages kept as an image for the offline stage, and that image's runs there
+DK_AGENT=$DK_TOOLS-agent; DK_AOFF=$DK_TOOLS-agent-off; DK_AFETCH=$DK_TOOLS-agent-fetch; DK_AIMG=nl-agent-tools${NL_DOCKER_TAG:+-$NL_DOCKER_TAG}
+# the label of $DK_AIMG: the disk step's image prune (a fresh runner, after the agent step) keeps the images with it
+DK_KEEP=org.foilbird.ci.keep=agent-tools
+export DK_TOOLS DK_OFF DK_IMG DK_AGENT DK_AOFF DK_AFETCH DK_AIMG
 DCPU=(); [ -z "${NL_DOCKER_CPUS:-}" ] || DCPU=(--cpus "$NL_DOCKER_CPUS")
 dk_clean() { [ -n "${NL_DOCKER_TAG:-}" ] || return 0
-  docker rm -f "$DK_TOOLS" "$DK_OFF" >/dev/null 2>&1 || true; docker image rm -f "$DK_IMG" >/dev/null 2>&1 || true; }
+  docker rm -f "$DK_TOOLS" "$DK_OFF" "$DK_AGENT" "$DK_AOFF" "$DK_AFETCH" >/dev/null 2>&1 || true
+  docker image rm -f "$DK_IMG" "$DK_AIMG" >/dev/null 2>&1 || true; }
+# shared host: the host's hosts file (the gpu image step writes 0.0.0.0 lines of the NVIDIA hosts into it) is saved when
+# a stage starts and put back last in every EXIT trap of run_stage (ci/hosts-guard.sh); the CI's after_script puts it
+# back again (a cancelled job may never reach the trap). NL_HOSTS_COPY: where the copy lives (GitLab: beside CI_TMP, so
+# after_script still finds it once CI_TMP is gone; default $CI_TMP/hosts.orig). Not a shared host: nothing saved
+HG_COPY=
+hosts_back() { [ -n "$HG_COPY" ] || return 0; "$TOP/ci/hosts-guard.sh" restore /etc/hosts "$HG_COPY" || exit 1; }
 # shared host: the packages a step needs must be there (nothing installed); prints the missing ones, rc 1
 host_has() { local p s m=; for p in "$@"; do s=$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null) || s=; [ "$s" = "install ok installed" ] || m="$m $p"; done
   [ -z "$m" ] || { echo "shared host: packages missing (install them once as root):$m"; return 1; }; }
@@ -122,9 +135,13 @@ for p in a["sets"]:
     roles = {}
     for e in p["files"]:
         roles[e["role"]] = roles.get(e["role"], 0) + 1
-    print("- [%s] %s key %s, InRelease sha256 %s (Date %s, Valid-Until %s), %s, files %s" % (p["set"], p.get("repository", ""),
-          p["key"]["fingerprint"], p["inrelease"]["sha256"][:16], p["inrelease"]["date"], p["inrelease"].get("valid_until") or "none", p["index"]["name"],
-          ", ".join("%s %d" % kv for kv in sorted(roles.items()))))
+    ix = p["index"]
+    print("- [%s] %s key %s, InRelease sha256 %s (Date %s, Valid-Until %s), %s %s %s, files %s; lock %s sha256 %s; chain %s" % (
+          p["set"], p.get("repository", ""), p["key"]["fingerprint"], p["inrelease"]["sha256"], p["inrelease"]["date"],
+          p["inrelease"].get("valid_until") or "none", ix["name"], ix.get("sha256", ix.get("sha512", "")), ix.get("size", ""),
+          ", ".join("%s %d" % kv for kv in sorted(roles.items())), p.get("lock"), p.get("lock_sha256"), p.get("chain_check", "missing")))
+    for e in p["files"]:
+        print("  - %s %s=%s sha256 %s size %d" % (e["role"], e["package"], e["version"], e["sha256"], e["size"]))
 u = json.load(open(sys.argv[2]))
 for c in u["components"]:
     if not c.get("origin"):
@@ -186,38 +203,86 @@ echo "pins (ci/run-stage.sh): mkosi $MKOSI_TAG $MKOSI_COMMIT; tools image $DEBIA
 echo "locale of the job: LANG=${LANG:-unset} LC_ALL=${LC_ALL:-unset} LC_COLLATE=${LC_COLLATE:-unset} (sorting in this script: LC_ALL=C)" | tee -a "$SUM"
 )
 
-# the agent on the pinned toolchain: install-tools, cargo test x3, build-release -> $T/dist
+# the agent on the pinned toolchain: install-tools, cargo test x3, build-release -> $T/dist. The whole agent build runs
+# in a container of the pinned Debian image (DEBIAN_IMAGE) with the C toolchain of agent/c-toolchain.pins from the
+# build's own Debian snapshot (ring's C through musl-gcc, the link through cc/ld: a host's own gcc gave other bytes),
+# checked after the install and in the binary (ci/agent-toolchain.sh). Mounted at their own paths: the tree, CI_TMP and
+# the tools base /opt/foilbird-build-tools (the wrapper's absolute path is in the crates' hashes). It runs as the caller;
+# HOME, rustup and cargo are in CI_TMP ($T/agent-home); SOURCE_DATE_EPOCH = the commit time, given (no git inside);
+# CARGO_BUILD_JOBS and RUST_TEST_THREADS go in when set (docker's cgroup is outside a runner's quota). The offline stage
+# keeps the container's packages as a local image ($DK_AIMG) for the agent built offline (ci/offline.sh).
+# gpg + gpg-agent: agent/tools/offline-inputs.sh (gpgcheck: --show-keys, --import, --verify) runs in this image for the
+# offline stage's fetch and install; --import starts gpg-agent, and gpg only Recommends gnupg (-> gpg-agent), which
+# --no-install-recommends leaves out (G8 alpha3 job 18: import rc=2, "failed to start gpg-agent"). No dirmngr (no
+# keyserver or network call of gpg) and no pinentry (no secret key, no passphrase) are needed.
 step_agent() (
 set -eo pipefail
 set +e -uo pipefail   # no errexit here: the failures that decide this step are read explicitly below (rc, fail, exit)
-if [ "${NL_SHARED_HOST:-0}" = 1 ]; then host_has musl-tools rustup || exit 1
-else sudo apt-get update -q >/dev/null && sudo apt-get install -y -q --no-install-recommends musl-tools >/dev/null; fi
 cd "$TOP/agent"
-rustup show active-toolchain || rustup toolchain install   # rust-toolchain.toml: 1.100.0 + musl target
-line="agent: rustc $(rustc --version | cut -d' ' -f2-)"
-fail=0
+fail=0; line="agent:"
 # the agent's build tools: one absolute path on every build machine (docs/reproducible-build.md), named by
 # build-release.sh itself; made through sudo here, or once by root on a runner without sudo: then it must exist and be writable
 tb=$(dirname "$(./build-release.sh --print-tools-root)")
 if [ -d "$tb" ] && [ -w "$tb" ]; then :
 elif ! sudo -n install -d -o "$(id -u)" -g "$(id -g)" "$tb" 2>/dev/null; then
-  echo "agent: $tb missing or not writable, and no sudo -n to make it (create it once as root)"; fail=1
+  echo "AGENT FAIL agent: $tb missing or not writable, and no sudo -n to make it (create it once as root)" | tee -a "$SUM"; exit 1
 fi
-[ $fail = 1 ] || ./build-release.sh --install-tools > "$T/agent-tools.log" 2>&1 || { fail=1; tail -n 30 "$T/agent-tools.log"; }
+ts=$(sh "$TOP"/images/debian/tools/snapshot check) || { echo "AGENT FAIL agent: images/debian/tools/snapshot check" | tee -a "$SUM"; exit 1; }
+cc=$("$TOP"/ci/agent-toolchain.sh apt-args) || { echo "AGENT FAIL agent: agent/c-toolchain.pins" | tee -a "$SUM"; exit 1; }
+AH=$T/agent-home; mkdir -p "$AH"
+docker rm -f "$DK_AGENT" >/dev/null 2>&1; trap 'docker rm -f "$DK_AGENT" >/dev/null 2>&1' EXIT
+docker run -d "${DCPU[@]}" --name "$DK_AGENT" -v "$TOP:$TOP" -v "$T:$T" -v "$tb:$tb" -w "$TOP/agent" "$DEBIAN_IMAGE" sleep infinity >/dev/null ||
+  { echo "AGENT FAIL agent: docker run $DEBIAN_IMAGE" | tee -a "$SUM"; exit 1; }
+srcs="Types: deb\nURIs: http://snapshot.debian.org/archive/debian/$ts\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/$ts\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n"
+ok=0
+for d in 0 30 90; do
+  sleep $d
+  docker exec "$DK_AGENT" sh -c "rm -f /etc/apt/sources.list.d/*; printf '$srcs' > /etc/apt/sources.list.d/snapshot.sources
+    apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=3 update -q &&
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends $cc rustup ca-certificates curl gpg gpg-agent xz-utils python3" > "$T/agent-apt.log" 2>&1 && { ok=1; break; }
+  tail -n 5 "$T/agent-apt.log"
+done
+if [ $ok = 0 ]; then
+  if grep -q -E '^(Err:[0-9]+ https?://snapshot\.debian\.org|[EW]: Failed to fetch https?://snapshot\.debian\.org|[EW]: .*snapshot\.debian\.org.*(Could not connect|Connection timed out|Could not resolve))' "$T/agent-apt.log"; then
+    echo "AGENT FAIL agent: SNAPSHOT UNAVAILABLE while installing the C toolchain (run did not take place)" | tee -a "$SUM"; exit 75; fi
+  echo "AGENT FAIL agent: apt-get in the agent container (snapshot $ts): $(tail -n 1 "$T/agent-apt.log")" | tee -a "$SUM"; exit 1
+fi
+echo "agent container: $DEBIAN_IMAGE, snapshot $ts, $(docker exec "$DK_AGENT" rustup --version 2>/dev/null | sed -n 1p)" | tee -a "$SUM"
+"$TOP"/ci/agent-toolchain.sh check docker exec "$DK_AGENT" | tee -a "$SUM"
+[ "${PIPESTATUS[0]}" = 0 ] || { echo "AGENT FAIL agent: the C toolchain in the container is not agent/c-toolchain.pins" | tee -a "$SUM"; exit 1; }
+if [ -n "${NL_OFFLINE_VARIANT:-}" ]; then   # the offline stage: the same packages for the offline build, no network then
+  docker commit --change "LABEL $DK_KEEP" "$DK_AGENT" "$DK_AIMG" >/dev/null ||
+    { echo "AGENT FAIL agent: docker commit $DK_AGENT $DK_AIMG" | tee -a "$SUM"; exit 1; }
+fi
+A=(docker exec -u "$(id -u):$(id -g)" -w "$TOP/agent" -e HOME="$AH" -e RUSTUP_HOME="$AH/rustup" -e CARGO_HOME="$AH/cargo"
+   -e SOURCE_DATE_EPOCH="$(git -C "$TOP" log -1 --format=%ct)")
+[ -z "${CARGO_BUILD_JOBS:-}" ] || A+=(-e "CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS")
+[ -z "${RUST_TEST_THREADS:-}" ] || A+=(-e "RUST_TEST_THREADS=$RUST_TEST_THREADS")
+A+=("$DK_AGENT")
+"${A[@]}" sh -c 'rustup show active-toolchain || rustup toolchain install' > "$T/agent-rustup.log" 2>&1 ||
+  { tail -n 20 "$T/agent-rustup.log"; echo "AGENT FAIL agent: rustup toolchain install in the container" | tee -a "$SUM"; exit 1; }   # rust-toolchain.toml: 1.100.0 + musl target
+line="$line rustc $("${A[@]}" rustc --version | cut -d' ' -f2-)"
+[ $fail = 1 ] || "${A[@]}" ./build-release.sh --install-tools > "$T/agent-tools.log" 2>&1 || { fail=1; tail -n 30 "$T/agent-tools.log"; }
 line="$line; install-tools rc=$fail"
 tests='"" esp-bridge-tls lab-crash-points'; [ "${STAGE:-}" = harness ] && tests=   # harness: the dist only, its tests run in the build stages
 eval "set -- $tests"
 for f in "$@"; do
-  cargo test --release --locked --no-fail-fast ${f:+--features $f} > "$T/test_${f:-product}.log" 2>&1; rc=$?
+  "${A[@]}" cargo test --release --locked --no-fail-fast ${f:+--features $f} > "$T/test_${f:-product}.log" 2>&1; rc=$?
   p=$(grep -ho '[0-9]* passed' "$T/test_${f:-product}.log" | awk '{s+=$1} END{print s+0}')
   q=$(grep -ho '[0-9]* failed' "$T/test_${f:-product}.log" | awk '{s+=$1} END{print s+0}')
   line="$line; test ${f:-product} rc=$rc passed=$p failed=$q"
   [ $rc = 0 ] || { fail=1; grep -E '^test .* FAILED|panicked|error(\[|:)' "$T/test_${f:-product}.log" | head -n 20; }
 done
-OUT=$T/dist ./build-release.sh > "$T/agent-release.log" 2>&1; rc=$?
+"${A[@]}" env OUT="$T/dist" ./build-release.sh > "$T/agent-release.log" 2>&1; rc=$?
 [ $rc = 0 ] || { fail=1; tail -n 30 "$T/agent-release.log"; }
 line="$line; build-release rc=$rc"
+# the toolchain actually installed, with the dist: build-all.sh records it in the build manifest (input param lines)
+if [ $rc = 0 ]; then "$TOP"/ci/agent-toolchain.sh record "$T/dist/C-TOOLCHAIN" docker exec "$DK_AGENT" || fail=1; fi
 [ -f "$T/dist/SHA256SUMS" ] && line="$line; $(tr '\n' ' ' < "$T/dist/SHA256SUMS")$(cat "$T/dist/FEATURES")"
+if [ -f "$T/dist/foil-agent" ]; then
+  "$TOP"/ci/agent-toolchain.sh comment "$T/dist/foil-agent" docker exec "$DK_AGENT" | tee -a "$SUM"
+  [ "${PIPESTATUS[0]}" = 0 ] || fail=1
+fi
 echo "AGENT $([ $fail = 0 ] && echo PASS || echo FAIL) $line" | tee -a "$SUM"
 exit $fail
 )
@@ -228,13 +293,18 @@ set -eo pipefail
 set -uo pipefail
 # about 11G free before the build, 7G after the slot initrd and recovery (two tools trees of 1.5G);
 # the image adds a third tools tree and the build overlay. Removed: toolchains this job never uses (none of them is
-# a build input), docker images other than the tools image are pulled later
+# a build input), docker images other than the tools image are pulled later. The offline stage's agent image ($DK_AIMG,
+# made by the agent step before this one) carries the label $DK_KEEP and is kept: the bundle and the offline agent build
+# run in it (ci/offline.sh); without the filter the prune removed it (try-12: "no agent container image nl-agent-tools")
 before=$(df -h / | awk 'NR==2{print $4}')
 if [ "${NL_SHARED_HOST:-0}" = 1 ]; then echo "runner disk: shared host, nothing removed; free on / $before" | tee -a "$SUM"; exit 0; fi
 sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
   /usr/local/share/boost /usr/share/swift /usr/local/julia* /opt/az /usr/local/share/powershell /opt/microsoft
-docker image prune -a -f >/dev/null 2>&1 || true
-echo "runner disk: free on / $before -> $(df -h / | awk 'NR==2{print $4}')" | tee -a "$SUM"
+docker image prune -a -f --filter "label!=$DK_KEEP" >/dev/null 2>&1 || true
+if [ -n "${NL_OFFLINE_VARIANT:-}" ] && ! docker image inspect "$DK_AIMG" >/dev/null 2>&1; then
+  echo "DISK FAIL: the offline stage's agent image $DK_AIMG is gone after the prune" | tee -a "$SUM"; exit 1; fi
+kept=; [ -z "${NL_OFFLINE_VARIANT:-}" ] || kept=", kept $DK_AIMG"
+echo "runner disk: free on / $before -> $(df -h / | awk 'NR==2{print $4}')$kept" | tee -a "$SUM"
 )
 
 # host packages and mkosi at its pinned commit -> $T/mkosi
@@ -522,6 +592,9 @@ if [ -f "$M" ]; then
   } > "$S"
   cat "$S" >> "$SUM"; head -n 4 "$S"
   echo "=== BEGIN build-manifest.txt"; cat "$M"; echo "=== END build-manifest.txt"
+  # the full provenance of the third-party sets (every InRelease, index, .deb with sha256): the evidence of the run
+  # (build-manifest.py extract --block apt-pin-inputs.json; `apt-inputs` gives its manifest lines back)
+  echo "=== BEGIN apt-pin-inputs.json"; sed '$a\' images/debian/mkosi/apt-pin-inputs.json; echo "=== END apt-pin-inputs.json"   # sed: the END marker on a line of its own
   provenance_summary images/debian/mkosi/apt-pin-inputs.json profiles/k8s-worker/upstream/upstream.json || exit 1
 else
   echo "build manifest: none (build-all.sh rc=$rc)" | tee -a "$SUM"
@@ -662,14 +735,22 @@ run_stage() { # run_stage <stage>: the steps of build.yml for that stage, in ord
     *) echo "run-stage.sh: unknown stage $1 (gate|selfcheck|lock|cp|gpu|harness|offline)" >&2; return 2 ;;
   esac
   STAGE=$1; export STAGE
-  dk_clean; trap dk_clean EXIT   # the job's docker names: none left from before, none left after
+  # shared host: a hosts file with an NVIDIA 0.0.0.0 line left from before fails the stage here, before any change
+  if [ "${NL_SHARED_HOST:-0}" = 1 ]; then
+    HG_COPY=${NL_HOSTS_COPY:-$T/hosts.orig}
+    "$TOP/ci/hosts-guard.sh" save /etc/hosts "$HG_COPY" || { HG_COPY=; return 1; }
+  fi
+  dk_clean; trap 'dk_clean; hosts_back' EXIT   # the job's docker names: none left from before, none left after
   [ "$1" = harness ] && { CI_TAG_GLOB=${CI_TAG_GLOB:-harness-try-*}; export CI_TAG_GLOB; }
-  # offline: the online build is cp and fills mkosi's package cache for the bundle
+  # offline: the online build is the stage's variant (gpu: NVIDIA offline after the fetch, as the gpu stage) and fills
+  # mkosi's package cache for the bundle; ci/offline.sh builds the same variant offline
   if [ "$1" = offline ]; then
-    STAGE=cp; NL_PKGCACHE=$T/pkgcache; mkdir -p "$NL_PKGCACHE"; export STAGE NL_PKGCACHE
+    NL_OFFLINE_VARIANT=${NL_OFFLINE_VARIANT:-cp}
+    case $NL_OFFLINE_VARIANT in cp|gpu) ;; *) echo "run-stage.sh: NL_OFFLINE_VARIANT [$NL_OFFLINE_VARIANT]: cp or gpu" >&2; return 2 ;; esac
+    STAGE=$NL_OFFLINE_VARIANT; NL_PKGCACHE=$T/pkgcache; mkdir -p "$NL_PKGCACHE"; export STAGE NL_PKGCACHE NL_OFFLINE_VARIANT
     # the private parts of the job's TEST keys never outlive the stage, whatever step fails (ci/offline.sh clean removes
     # them on the way; this covers a failure before it)
-    trap 'rm -rf "$T/bkey" "$T/probes"; dk_clean' EXIT
+    trap 'rm -rf "$T/bkey" "$T/probes"; dk_clean; hosts_back' EXIT
     # shared host: the agent's tools set at its one absolute path (/opt/foilbird-build-tools/...) is the host's; the stage
     # builds its own there (online) and its clean removes it, as on a fresh runner. The host's set waits beside it and
     # comes back on the way out, whatever step fails; the stage's own set (online or offline built) goes
@@ -680,7 +761,7 @@ run_stage() { # run_stage <stage>: the steps of build.yml for that stage, in ord
       [ ! -e "$TSA" ] || { echo "run-stage.sh: $TSA is there (a stage before did not put it back): put it back by hand" >&2; return 1; }
       [ ! -e "$TS" ] || mv -- "$TS" "$TSA" || { echo "run-stage.sh: could not put $TS aside" >&2; return 1; }
       echo "shared host: the host's agent tools set $([ -e "$TSA" ] && echo "put aside ($TSA)" || echo "absent")"
-      trap 'rm -rf "$T/bkey" "$T/probes"; rm -rf --one-file-system -- "$TS"; [ ! -e "$TSA" ] || { mv -- "$TSA" "$TS" && echo "shared host: the host'"'"'s agent tools set put back ($TS)"; }; dk_clean' EXIT
+      trap 'rm -rf "$T/bkey" "$T/probes"; rm -rf --one-file-system -- "$TS"; [ ! -e "$TSA" ] || { mv -- "$TSA" "$TS" && echo "shared host: the host'"'"'s agent tools set put back ($TS)"; }; dk_clean; hosts_back' EXIT
     fi
   fi
   for s in $order; do

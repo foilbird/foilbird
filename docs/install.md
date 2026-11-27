@@ -1,8 +1,9 @@
 # Installing a node (v1-alpha)
 
 v1-alpha publishes no images: you build one with your own keys, then install it. The only install path verified in
-v1-alpha is a **virtual machine** (QEMU/KVM with OVMF Secure Boot and a TPM 2.0). A physical machine has no supported
-way to receive the agent's TLS material yet ([release notes](release-notes/v1-alpha.md), "Known limitations").
+v1-alpha is a **virtual machine** with OVMF Secure Boot and a TPM 2.0: plain QEMU/KVM or Proxmox VE (section 5). A
+physical machine has no supported way to receive the agent's TLS material yet
+([release notes](release-notes/v1-alpha.md), "Known limitations").
 
 The commands below follow what the test harness does (`tests/lib/keys.sh`, `tests/lib/vm.sh`); read those scripts for
 the exact options. Every key you create here belongs to your deployment. Never commit one.
@@ -11,9 +12,11 @@ the exact options. Every key you create here belongs to your deployment. Never c
 
 Debian 13 with mkosi, OpenSSL and GnuPG, plus Rust (`rustup`; `agent/rust-toolchain.toml` pins the compiler) and
 `musl-tools` for the agent. The build scripts name what else they need when it is missing; a list of verified tool
-versions is not part of v1-alpha. The image build fetches packages from Debian, the Kubernetes
-repository and NVIDIA's repository, checking each against a pinned key (`images/debian/README.md`,
-`profiles/k8s-worker/README.md`).
+versions is not part of v1-alpha. An agent built with the host's own gcc and binutils works, but its bytes differ from a
+CI build and the build manifest records it as `agent-toolchain` `unrecorded`; for the same bytes as CI, build the agent
+with the C toolchain of `agent/c-toolchain.pins` (`docs/reproducible-build.md`, "C toolchain of the agent"). The
+image build fetches packages from Debian, the Kubernetes repository and NVIDIA's repository, checking each against a
+pinned key (`images/debian/README.md`, `profiles/k8s-worker/README.md`).
 
 ## 2. Keys
 
@@ -86,6 +89,8 @@ On the first boot the image enrolls its Secure Boot keys (setup mode: **trust on
 under Secure Boot, creates slot B, the reserved `state` partition and `/var` (LUKS2, bound to the TPM) with
 `systemd-repart`, and starts the agent on port 7443. With virtual firmware that already holds your PK, KEK and db,
 setup mode is not needed (`tests/lib/vm.sh`, `--enroll vars`).
+Known limitation: the first boot needs `/var` created within 5 minutes (`foil-repart.service`, `TimeoutStartSec=300`);
+a slower disk fails the installation.
 
 Check it:
 
@@ -93,6 +98,35 @@ Check it:
 foilctl --addr https://127.0.0.1:7443 --server-name <SAN> --tls-dir pki/reader health
 foilctl --addr https://127.0.0.1:7443 --server-name <SAN> --tls-dir pki/reader info   # Secure Boot, TPM, var_protection
 ```
+
+### Proxmox VE
+
+Verified on Proxmox VE 9.3 (2026-11-26) with a v1-alpha2 image (TEST keys); not re-run on
+v1-alpha3. A control plane and a worker: first boot as above, configuration, Kubernetes init and join, reboot through
+the agent. As root on the Proxmox host,
+with the disk image and the three SMBIOS files from section 4 in `$F`:
+
+```sh
+V=9101; S=<storage>; F=/root/foil
+qm create $V --name cp1 --machine q35 --bios ovmf --cpu host --cores 2 --memory 3072 --balloon 0 \
+  --net0 virtio,bridge=vmbr0 --ostype l26 --scsihw virtio-scsi-single \
+  --efidisk0 $S:1,efitype=4m,pre-enrolled-keys=0 --tpmstate0 $S:1,version=v2.0 \
+  --virtio0 $S:0,import-from=$F/foilbird-deb_1.raw --boot order=virtio0
+qm resize $V virtio0 16G
+qm set $V --args "-smbios type=11,path=$F/smbios/agent.tls-cert -smbios type=11,path=$F/smbios/agent.tls-key \
+  -smbios type=11,path=$F/smbios/agent.tls-ca -chardev file,id=ser,path=$F/cp1-serial.log -serial chardev:ser"
+qm start $V
+```
+
+- `efitype=4m,pre-enrolled-keys=0` gives the Secure Boot OVMF (`OVMF_CODE_4M.secboot.fd`) with empty variables:
+  setup mode, as above (`qm showcmd $V` shows it).
+- The SMBIOS strings go through `args`, which only root may set (`qm set --args`, kept in
+  `/etc/pve/qemu-server/<vmid>.conf`); root on the Proxmox host can read them (decision 0010).
+- The serial console of the image (ttyS0) is written to a file through `args`; the first boot is logged there.
+- The first boot formats `/var`; on a slow disk (an HDD with discard) it took about 3.5 minutes until the agent
+  listened.
+- Give each node a fixed address (a DHCP reservation by MAC or a static address in its configuration): the Kubernetes
+  endpoint and the API server certificate name the address of the first configuration.
 
 ## 6. Configure
 

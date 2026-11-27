@@ -77,8 +77,10 @@ transient download errors with exponential back-off and then runs the same check
 contacts the repositories: `prepare` copies the verified files and the original signed metadata into
 `mkosi/aptpin/srv/apt-pin/<set>` (apt source `file:/srv/apt-pin/<set>/`, re-verified by apt in the build, apt
 preferences admit only the pinned packages from it) and writes `pinned.conf`, `nvsrc/` and `nvsrc/nvidia-inputs.json`,
-the provenance of every NVIDIA input (key, `InRelease` hash and date, each `.deb` with URL and sha256), which the build
-copies to `/usr/share/foilbird/sbom/nvidia-inputs.json` in the image (`apt-pin-inputs.json`: all sets). All of it is
+the provenance of every NVIDIA input as the image carries it (key, origin, label and suite, each `.deb` with URL and
+sha256; without the fields of the `InRelease` and index as fetched), which the build copies to
+`/usr/share/foilbird/sbom/nvidia-inputs.json` in the image. The fetched fields (the `InRelease` hash and date, the index
+hashes) are only in `apt-pin-inputs.json` (all sets), recorded in the build manifest (decision 0017). All of it is
 gitignored.
 `tools/apt-pin-test.py` runs the refusal probes against a filled cache, for every set: a changed `.deb`, a `.deb` with a
 matching sha256 but no signed chain, unsigned or foreign-signed `InRelease`, a planted key, forged hash lines after the

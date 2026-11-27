@@ -42,11 +42,14 @@ if [ -n "${TOOLS_ROOT:-}" ] && [ "$TOOLS_ROOT" != "$TOOLS_SET" ]; then
     echo "build-release: TOOLS_ROOT=$TOOLS_ROOT, but the build tools must be at $TOOLS_SET (docs/reproducible-build.md)" >&2; exit 1
 fi
 TOOLS_ROOT=$TOOLS_SET
-mk="create it once: sudo install -d -o $(id -un) -g $(id -gn) $TOOLS_BASE"
+# the caller may be a uid with no passwd entry (CI runs the agent build as docker exec -u <uid>:<gid>): `id -un` fails
+# there and set -e would end the script without a line; the number names the owner just as well
+who=$(id -un 2>/dev/null || id -u); grp=$(id -gn 2>/dev/null || id -g)
+mk="create it once: sudo install -d -o $who -g $grp $TOOLS_BASE"
 [ -d "$TOOLS_BASE" ] || { echo "build-release: $TOOLS_BASE missing; $mk" >&2; exit 1; }
 PATH=$TOOLS_ROOT/bin:$PATH
 if [ "${1:-}" = --install-tools ]; then
-    { [ -w "$TOOLS_BASE" ] || [ -w "$TOOLS_ROOT" ]; } || { echo "build-release: $TOOLS_BASE not writable for $(id -un); $mk" >&2; exit 1; }
+    { [ -w "$TOOLS_BASE" ] || [ -w "$TOOLS_ROOT" ]; } || { echo "build-release: $TOOLS_BASE not writable for $who; $mk" >&2; exit 1; }
     mkdir -p "$TOOLS_ROOT"
     # a fixed build directory and the same path mapping online and offline: the tools' binaries do not depend on
     # CARGO_HOME or on cargo install's temporary directory

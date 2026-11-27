@@ -13,7 +13,9 @@
 //!   foilctl --on-behalf-of WHO ...   (any command: recorded in the node's audit log, never grants anything)
 //!   foilctl ... --target V stage
 //!   foilctl ... [--failed] units
-//!   foilctl ... [--unit U] [--priority 0-7] [--boot 0|-1|..] [--since UNIX] [--until UNIX] [--limit N] journal
+//!   foilctl ... [--unit NAME.TYPE] [--priority 0-7] [--boot 0|-1|..] [--since UNIX] [--until UNIX] [--limit N] journal
+//!          (--unit: the full unit name, e.g. foil-agent.service, kubelet.service; a short name is refused, InvalidArgument.
+//!          The agent's audit lines are WARN, priority 4: --priority 4 shows them)
 //!   foilctl ... [--boot 0|-1|..] [--priority 0-7] [--limit N] dmesg
 //!
 //! DIR holds client.crt, client.key and ca.crt (PEM).

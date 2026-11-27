@@ -31,9 +31,12 @@ variables:
   timeout: 6h
   # the job's work directory: only $CI_BUILDS_DIR/tmp/<job id>, removed on the way out (EXIT trap) and checked after
   script:
-    - T="$CI_BUILDS_DIR/tmp/$CI_JOB_ID"; case "$CI_BUILDS_DIR:$CI_JOB_ID" in /?*:[0-9]*) ;; *) echo "CI_TMP refused - $T"; exit 1 ;; esac; trap 'rm -rf --one-file-system -- "$T"' EXIT; CI_TMP="$T" CI_SUMMARY="$CI_PROJECT_DIR/summary.md" ci/run-stage.sh "$CI_JOB_STAGE"
+    - T="$CI_BUILDS_DIR/tmp/$CI_JOB_ID"; case "$CI_BUILDS_DIR:$CI_JOB_ID" in /?*:[0-9]*) ;; *) echo "CI_TMP refused - $T"; exit 1 ;; esac; trap 'rm -rf --one-file-system -- "$T"' EXIT; CI_TMP="$T" NL_HOSTS_COPY="$T.hosts" CI_SUMMARY="$CI_PROJECT_DIR/summary.md" ci/run-stage.sh "$CI_JOB_STAGE"
   after_script:
     - cat "$CI_PROJECT_DIR/summary.md" 2>/dev/null || true
+    # the host's hosts file back from the job's copy beside CI_TMP (ci/hosts-guard.sh; the stage's EXIT trap did it
+    # already unless the job was cancelled), then the copy removed
+    - '[ "${NL_SHARED_HOST:-0}" != 1 ] || ci/hosts-guard.sh final /etc/hosts "$CI_BUILDS_DIR/tmp/$CI_JOB_ID.hosts"'
     - T="$CI_BUILDS_DIR/tmp/$CI_JOB_ID"; [ ! -e "$T" ] || { echo "CI_TMP still there after the job - removing $T"; rm -rf --one-file-system -- "$T"; }
 
 # manual: `when` inside each rule, never at the job level beside `rules`; allow_failure keeps the later stages running
@@ -70,8 +73,10 @@ harness:
       when: manual
       allow_failure: true
 
-# the offline stage (ci/run-stage.sh offline, as .github/workflows/offline.yml): an online cp build, the input bundle and
-# its refusal probes, the network cut for the build only, cp again from the bundle alone, the two manifests compared.
+# the offline stage (ci/run-stage.sh offline, as .github/workflows/offline.yml): an online build of the variant, the input
+# bundle and its refusal probes, the network cut for the build only, the variant again from the bundle alone, the two
+# manifests compared. One job per variant: offline (cp) and offline-gpu (gpu, NVIDIA offline after the fetch as in the gpu
+# stage); a runner with concurrency 1 runs them one after the other.
 # Manual, from the web or on a tag of the offline-try pattern; the commit must carry an offline-try-* tag (CI_TAG_GLOB);
 # the agent is built offline from its inputs in the bundle, no interim dist from the online build
 offline:
@@ -80,6 +85,7 @@ offline:
   variables:
     CI_TAG_GLOB: "offline-try-*"
     NL_OFFLINE_AGENT_REQUIRED: "1"
+    NL_OFFLINE_VARIANT: "cp"
   rules:
     - if: $CI_PIPELINE_SOURCE == "web"
       when: manual
@@ -87,3 +93,8 @@ offline:
     - if: $CI_COMMIT_TAG =~ /^offline-try-[0-9]+(-[a-z0-9]+)?$/
       when: manual
       allow_failure: true
+
+offline-gpu:
+  extends: offline
+  variables:
+    NL_OFFLINE_VARIANT: "gpu"

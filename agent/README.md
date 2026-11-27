@@ -61,6 +61,22 @@ falls back to the DHCP ones (seen in tests: about 52 s after a dead configured s
 including timesyncd's pause after exhausting its servers); with a working configured server
 DHCP servers are not queried.
 
+Before the node's clock is synchronized (a fresh node before `ApplyConfig` sets its NTP servers, or a node whose
+servers do not answer), mTLS judges certificate validity by that clock. A client certificate issued moments ago can be
+refused with the TLS alert `CertificateExpired` instead of the error of its real cause (seen: a certificate of a foreign
+CA with a fresh `notBefore` on a node whose clock was slightly behind; the same certificate with a `notBefore` in the past
+gave `UnknownCA`): rustls checks the validity period before the chain. Either way the call is refused; read an
+"expired" right after issuing as "the node's clock", check `health` (`time-synced`) before anything else.
+
+## Diagnostics with foilctl
+- `journal --unit` takes the full unit name, `NAME.TYPE` (`foil-agent.service`, `foil-kubeadm-init.service`,
+  `kubelet.service`); a short name (`foil-agent`) is refused with InvalidArgument "unit: name.type, e.g. kubelet.service".
+- `journal` and `dmesg` are `DIAG` (roles diag, controller, operator, `api/README.md`); `reader` gets PermissionDenied.
+- The agent's lines carry the syslog priority of their level when its output is the journal (`<N>` prefix,
+  sd-daemon(3); `agent/src/logfmt.rs`): ERROR 3, WARN 4, INFO 6. The audit lines (`WARN … denied`,
+  `WARN call … DESTRUCTIVE`, rollback, reboot, raise) are priority 4: `journal --unit foil-agent.service --priority 4`
+  shows them. (Before v1-alpha3 every line of the agent was priority 6 and `--priority 4` hid them.)
+
 ## Updates (decision 0002)
 `StageUpdate(version)` downloads the whole release from the channel fixed in
 the image into `/var/lib/foil-agent/staging/`. The channel file

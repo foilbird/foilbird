@@ -91,6 +91,15 @@ content; the node then boots it as a plain `/var`. The image cannot tell this fr
 the controller admits `NONE` only for an explicit allow list of legacy nodes, and a node that reported `LUKS2_TPM2`
 before and `NONE` now is an incident, not a migration. PCR 15 makes the state visible to remote attestation.
 
+> **v1-alpha limitation** (fix planned for v1-alpha4): "`/var` is unreadable on a stolen disk" (threat model, attacker
+> C) holds for a disk without its machine. With physical access to the node itself (disk and TPM together) an attacker
+> can replace the encrypted `/var` by a plain ext4 partition with their own content, as above, and it is not inert: the
+> node boots it as a plain `/var` (`var_protection` `NONE`) and applies the configuration stored on it
+> (`/var/lib/foil-agent/config.pb`: the cluster to join, registries, hosts, update channel), so it runs what the
+> attacker's cluster schedules, which is root on the node. The key policy of the original `/var` is PCR 7 and a signed
+> PCR 11; the `/var` state goes to PCR 15 only, so on that boot the policy is still met and the key of a kept copy of
+> the original `/var` can be unsealed. The policy check above detects this only afterwards, and needs a controller.
+
 ## When no token opens /var (open question)
 
 Seen after a TPM reset (QEMU, swtpm state removed): no release opens `/var`, there is no recovery key. `foil-repart`
@@ -114,7 +123,9 @@ every loaded module under the Secure Boot policy), in the lab one retry per boot
 | Limit | Value | When it bites |
 |---|---|---|
 | unseal tries | 31 | extends faster than one policy session; then `foil-var-unlock` fails, the boot check fails, one boot try is spent |
-| `/dev/disk/foilbird/var-fs` device wait | 120 s (`JobRunningTimeoutSec=`, drop-in) | without it the default 30 s from boot start: an unlock that succeeds late still leaves the node without `/var` |
+| `/dev/disk/by-partlabel/var` device wait | 360 s (`JobRunningTimeoutSec=`, drop-in) | first boot only: the partition appears when `foil-repart` (at most 300 s) has formatted `/var` and written the table; without it the default 30 s from boot start fails `/var` on a slow disk, the boot check reboots and the boot is spent |
+| `/dev/disk/foilbird/var-fs` device wait | 480 s (`JobRunningTimeoutSec=`, drop-in) | the first boot's repart plus the unlock; without it the default 30 s from boot start: an unlock that succeeds late still leaves the node without `/var`. A failed unlock does not wait for it: `var.mount` has `Requires=foil-var-unlock.service` |
+| `foil-boot-check` | `After=foil-repart.service` | first boot only: the boot check and its reboot wait for the repartitioning; a reboot in the middle lost it (the table is written last) and the next boot started over |
 | `foil-var-unlock` | `TimeoutStartSec=90` | a hung TPM |
 
 Measured on QEMU/swtpm (PCR 13 extended in parallel loops during the unlock, ~7 extends/s): 1 loop — unlock 2.6–3.5 s,

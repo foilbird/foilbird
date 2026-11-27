@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# The offline build (docs/ci-gitlab.md) - an online cp build, the input bundle and its refusal probes, the network
-# cut for the build only (a network namespace: the runner keeps its own connection), cp again from the bundle alone,
-# the two manifests compared. Only on a push to a ci/offline-try-* branch, for a commit with an offline-try-* tag. Everything is in
+# The offline build (docs/ci-gitlab.md) - for each variant (cp, gpu; one job each) an online build, the input bundle and
+# its refusal probes, the network cut for the build only (a network namespace: the runner keeps its own connection), the
+# same variant again from the bundle alone, the two manifests compared. Only on a push to a ci/offline-try-* branch, for a commit with an offline-try-* tag. Everything is in
 # ci/run-stage.sh offline (ci/offline.sh): this file only fetches the commit and maps the GitHub variables. No upload,
 # no cache between jobs, no secrets, no third-party actions; only manifests and the summary go into the log.
 name: offline
@@ -25,7 +25,14 @@ defaults:
     shell: bash
 
 jobs:
+  # one job per image variant, each on its own runner (disk and time of a gpu bundle: docs/ci-gitlab.md); one failing
+  # variant does not cancel the other
   offline:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cp, gpu]
+    name: offline (${{ matrix.variant }})
     runs-on: ubuntu-24.04
     timeout-minutes: 160
     steps:
@@ -42,10 +49,11 @@ jobs:
           git -c http.extraHeader="AUTHORIZATION: basic $auth" fetch -q --depth 1 origin '+refs/tags/offline-try-*:refs/tags/offline-try-*' || true
           git checkout -q "$GITHUB_SHA"
 
-      - name: Offline stage (online cp, bundle, probes, network cut, offline cp, compare)
+      - name: Offline stage (online build, bundle, probes, network cut, offline build, compare) of the variant
         timeout-minutes: 150
         env:
           TOKEN: ${{ github.token }}
+          NL_OFFLINE_VARIANT: ${{ matrix.variant }}
         run: |
           CI_GIT_AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)" CI_OWN=$GITHUB_REPOSITORY \
             CI_TMP=$RUNNER_TEMP CI_SUMMARY=$GITHUB_STEP_SUMMARY src/ci/run-stage.sh offline

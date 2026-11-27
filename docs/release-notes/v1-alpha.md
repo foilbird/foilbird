@@ -52,6 +52,15 @@ library, no NVIDIA package cache. Images with NVIDIA components are built by eac
 - A node needs a usable, unique SMBIOS system UUID: the machine-id is derived from it on every boot
   ([docs/image-policy.md](../image-policy.md)).
 
+**Security limits** (fix planned for v1-alpha4)
+- **v1-alpha limitation:** a control plane's `k8s.init` is passed to `kubeadm init` as given, so on a node without a
+  role `ApplyConfig` with it is equivalent to root ([api/README.md](../../api/README.md#rules), "Rules").
+- **v1-alpha limitation:** "`/var` is unreadable on a stolen disk" holds for a disk without its machine, not for the
+  node itself (disk and TPM together) ([disk-encryption.md](../disk-encryption.md#disks-set-up-before-var-encryption)).
+- **v1-alpha limitation:** `Reboot` and `Rollback` with a `reason` longer than 200 bytes whose 200th byte falls inside a
+  multi-byte (non-ASCII) character stop the agent; systemd restarts it after about 2 s (the delay grows to 60 s on
+  repeats). The call does not take effect. Keep reasons short or ASCII.
+
 **API and compatibility**
 - The node agent API (`foilbird.agent.v1alpha1`) may change incompatibly in any later alpha. Agent and `foilctl` must
   come from the same release; a client finds the API versions an agent serves through `Discovery.GetApiVersions`, and a
@@ -67,6 +76,17 @@ library, no NVIDIA package cache. Images with NVIDIA components are built by eac
 - Protection against an older, correctly signed release served by a hostile update channel is only the anti-rollback
   floor (`min_version`); release metadata has no expiry yet.
 - One client CA: any certificate it issues with the operator role can call every RPC, including EMERGENCY ones.
+
+**Build and provenance**
+- The build manifest is not signed: provenance and attestation of a build are decision 0012, a later cycle. The
+  manifest and the CI log are evidence of a run, not a signed statement.
+- The image carries no binding to a particular `InRelease` of a third-party repository (NVIDIA, pkgs.k8s.io): it is
+  tied to the repository through the signing key and the sha256 of each `.deb` in its SBOM. The `InRelease` and index a
+  build read, their date and signature, are only in that build's manifest; checking that an image came from a
+  particular signed `InRelease` needs that manifest ([decision 0017](../decisions/0017-third-party-repository-metadata.md)).
+- The agent's binaries are byte-for-byte equal to a CI build only when built with the pinned C toolchain
+  (`agent/c-toolchain.pins`, in the pinned Debian image of CI); an agent built with a build host's own gcc is recorded
+  as `unrecorded` in the manifest ([reproducible-build.md](../reproducible-build.md)).
 
 **Configuration**
 - `ApplyConfig` applies at once; there is no dry run, diff, staged or try mode. A configuration that cuts the node off its
